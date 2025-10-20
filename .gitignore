@@ -1,0 +1,15 @@
+﻿# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Node / Web (if applicable)
+node_modules/
+
+# OS junk
+thumbs.db
+.DS_Store
+
+# Build outputs
+dist/
+build/

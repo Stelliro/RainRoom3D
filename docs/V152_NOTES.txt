@@ -1,0 +1,1 @@
+v1.5.2 fixes splash scaling bug and ensures exceptions are logged to out/engine_error.log.

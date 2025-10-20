@@ -1,0 +1,1 @@
+v1.7.1 Anti‑metal: tri‑notch EQ, AM jitter per partial, no diffusion on water by default, shorter high‑passed spray. NO WHITE NOISE.

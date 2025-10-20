@@ -1,0 +1,1 @@
+v1.6.0 adds a deterministic 'wet slap' transient (Ricker+chirplet, band‑limited), with --wetness/--slap-db controls. No white noise anywhere.

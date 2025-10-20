@@ -1,0 +1,1 @@
+v1.5 replaces bell-like tones with a deterministic splash-cluster (no noise). Shorter decays, slight glide, small allpass diffusion.

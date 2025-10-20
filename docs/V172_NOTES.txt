@@ -1,0 +1,1 @@
+v1.7.2 adds an anti‑click 'Liquidizer' on the first 6 ms (fade‑in + soft sat + LP + early reflections), lowers HP, adds DC blocker. NO WHITE NOISE.

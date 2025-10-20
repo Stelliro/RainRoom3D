@@ -1,0 +1,1 @@
+v1.5.1 restores a working CLI main so `-m app.audio.engine --single-drop` renders to out/single_drop.wav and prints the absolute path.

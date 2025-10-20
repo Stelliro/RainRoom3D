@@ -1,0 +1,1 @@
+v1.7.3 fixes a crash when splash grains started beyond the output buffer; same guard added to splat. Still NO WHITE NOISE. Includes v1.7.2 anti-click voicing.

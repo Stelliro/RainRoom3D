@@ -1,0 +1,1 @@
+v1.7.0 adds explicit SPLASH layers (cloud + spray tail), deterministic and NO WHITE NOISE. Tunables: --splash-db, --spray-db, --spray-tail-ms.

@@ -1,0 +1,1 @@
+v1.7.3b hotfix: removed erroneous 'z: float=3.0' line and duplicate ev line. Keeps v1.7.3 crash guards and v1.7.2 voicing. NO WHITE NOISE.
