@@ -97,15 +97,13 @@ if exist "bin\RainRoom3D.exe" (
 )
 
 set "EDCMD="
-if exist "app\editor\__main__.py" set "EDCMD=%PYCMD% -m app.editor"
-if "%EDCMD%"=="" if exist "app\editor\main.py" set "EDCMD=%PYCMD% app\editor\main.py"
+if exist "app\main.py" set "EDCMD=%PYCMD% -m app.main"
+if "%EDCMD%"=="" if exist "app\editor\__main__.py" set "EDCMD=%PYCMD% -m app.editor"
 if "%EDCMD%"=="" if exist "app\ui\__main__.py" set "EDCMD=%PYCMD% -m app.ui"
-if "%EDCMD%"=="" if exist "app\ui\main.py" set "EDCMD=%PYCMD% app\ui\main.py"
-if "%EDCMD%"=="" if exist "app\main.py" set "EDCMD=%PYCMD% app\main.py"
 
 if "%EDCMD%"=="" (
   echo [run v8] ERROR: Could not locate a 3D editor entry point. >> "%ELOG%"
-  echo [run v8] Looked for: bin\RainRoom3D.exe, app\editor\(__main__.py|main.py), app\ui\(__main__.py|main.py), app\main.py >> "%ELOG%"
+  echo [run v8] Looked for: bin\RainRoom3D.exe, app\editor\^(__main__.py^|main.py^), app\ui\^(__main__.py^|main.py^), app\main.py >> "%ELOG%"
 ) else (
   echo [run v8] starting: %EDCMD% >> "%ELOG%"
   start "" %EDCMD%
