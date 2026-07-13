@@ -13,55 +13,53 @@
 | **Default layout** | [`configs/my_house.json`](configs/my_house.json) (Living Room) |
 | **License** | [PolyForm Noncommercial 1.0.0](LICENSE) — **no commercial use** |
 
-> **Work in progress.** Audio, spatial routing, and UI are actively evolving. Expect rough edges, especially around rain timbre and multi-device quirks. Feedback and experiments welcome for **noncommercial** use.
+> **Work in progress.** Spatial rain, multi-device routing, and the editor are actively evolving. Expect rough edges. Noncommercial use and feedback welcome.
 
 <p align="center">
-  <img src="docs/media/hero_rain_window.jpg" alt="Rain through a living-room window — the feel RainRoom3D aims for" width="860" />
+  <img src="docs/media/hero_app.jpg" alt="RainRoom3D — Design house floor plan (actual app screenshot)" width="920" />
 </p>
 
 <p align="center">
-  <img src="docs/media/ui_3d_editor.jpg" alt="3D editor concept: house, windows, You marker, speakers" width="420" />
+  <img src="docs/media/hero_3d.jpg" alt="3D software preview with rain (actual app screenshot)" width="450" />
   &nbsp;
-  <img src="docs/media/ui_floorplan.jpg" alt="Floor-plan concept: footprint, windows, speakers" width="420" />
+  <img src="docs/media/screenshot_simulate.jpg" alt="Simulate rain controls (actual app screenshot)" width="450" />
 </p>
 
-*UI images are illustrative previews for the README; the live app uses the Python/PySide6 editor described below.*
+*All images above are **real screenshots** of the running app (not mockups).*
 
 ---
 
-## What is this?
+## Status — work in progress
 
-RainRoom3D is a **Windows desktop experiment** that couples:
+RainRoom3D is a personal **Windows** experiment for spatial outdoor rain. It is **not** a finished commercial product.
 
-1. A **house + terrain** editor (footprint, windows, open styles, “You” listener, speakers)  
-2. A **procedural outdoor rain field** (continuous wash + soft wet impacts)  
-3. **Spatial routing** so rain couples indoors through **open windows** (distance, delay, air absorption)  
-4. Playback as **binaural headphones** and/or **mapped real speakers** (each speaker ≈ a mic in the room)
+| Ready enough to try | Still rough |
+|---------------------|-------------|
+| House / window / speaker editor | Rain timbre (wet vs wash) still tuning |
+| Binaural **You** + multi-device speakers | Multi-device depends on your OS devices |
+| Quantity · sharpness · volume · wind | OpenGL vs software 3D varies by GPU |
+| Default Living Room layout | No first-class macOS / Linux support |
 
-It is **not** a finished commercial product, a DAW plugin, or a general game engine. It is a personal spatial-rain playground you can run and tinker with.
+---
 
-### What it can do today
+## What it can do
 
-- Load a **Living Room** default (`configs/my_house.json`) with your layout, quantity, sharpness, and volume prefs  
-- Edit **room size**, **windows** (open amount, hinge/style), **speakers** (position, size, device, gain)  
-- **Play as You** (binaural), **speakers only**, or **You + speakers**  
-- Control **quantity** (how many hits), **sharpness**, **master volume**, **wind** (speed / direction / variation)  
-- Outdoor **depth layers** (near / mid / far / roof / canopy) + optional rain loop WAVs in `assets/audio/rain/`  
-- Soft wet impacts (unpitched) with rare hollow tarp/shell specials  
+- **Design** a house on outdoor terrain — footprint, materials, windows (open style, sill, hinge)  
+- Place **You** (binaural listener) and **speakers**, assign real OS output devices  
+- **Simulate** outdoor rain: continuous wash + soft wet impacts, depth layers (near/mid/far/roof/canopy)  
+- Rain couples through **open windows** (distance, delay, air absorption)  
+- **Play as You**, **mapped speakers**, or **You + speakers**  
+- Optional rain loop WAVs in [`assets/audio/rain/`](assets/audio/rain/)  
 
-### Known limits (WIP)
-
-- Rain synthesis is still being tuned (wet vs wash vs brightness)  
-- Multi-device routing depends on OS devices and may need manual assignment  
-- OpenGL / software 3D views can differ by GPU/driver  
-- No macOS/Linux first-class support yet  
-- Not production-audio certified; bring headphones and patience  
+<p align="center">
+  <img src="docs/media/screenshot_speakers.jpg" alt="Speakers step — device list and outputs (actual screenshot)" width="920" />
+</p>
 
 ---
 
 ## Quick start
 
-**Requirements:** Windows · Python 3.10+ · working sound output
+**Requirements:** Windows · Python 3.10+ · sound output
 
 ```powershell
 git clone https://github.com/Stelliro/RainRoom3D.git
@@ -72,22 +70,24 @@ python -m app.main
 
 Or double-click **`run.bat`**.
 
-### Suggested first listen
+### First listen
 
 1. App loads **Living Room** by default  
-2. Open windows a bit in the inspector  
-3. Set **Quantity** low (e.g. ~4%), **Volume** mid (~58%), leave **Sharpness** where you like  
+2. Open a window a little in the inspector  
+3. Quantity ~**4%**, Volume ~**58%**, set Sharpness to taste  
 4. **Play as You** with headphones  
 
 ---
 
 ## Workflow
 
-1. **Design house** — footprint on terrain; windows on walls that face the weather  
-2. **Place “You”** — blue listener for binaural  
-3. **Speakers** — put them where they sit in real life; assign OS output devices; test each  
-4. **Simulate** — quantity / sharpness / wind / volume  
-5. **Play** — You · Speakers · You + Speakers  
+| Step | What you do |
+|------|-------------|
+| **1 Design** | Size the house, place windows, set materials |
+| **2 Speakers** | Refresh devices, map OS outputs, test tones |
+| **3 Simulate** | Quantity / sharpness / wind / volume → Play |
+
+Views: **Floor plan** · **3D software** (always works) · **OpenGL 3D** (when available).
 
 ---
 
@@ -97,39 +97,27 @@ Or double-click **`run.bat`**.
 app/                 UI, models, spatial rain engine
 assets/audio/rain/   Optional outdoor rain WAV loops
 configs/             my_house.json (default), example_room.json
-docs/                Design notes + README media
-scripts/             Rain sample generator, packaging helpers
+docs/media/          README screenshots (real captures)
+scripts/             Screenshots, packaging, rain sample gen
 ```
 
-| Doc | |
-|-----|---|
-| [Audio engine notes](docs/AUDIO_ENGINE_NOTES.md) | Synthesis / spatial design |
-| [Weather controls](docs/WEATHER_CONTROLS.md) | Control schema |
-| [Rain sample assets](assets/audio/rain/README.md) | Drop real rain WAVs here |
-
----
-
-## Optional CLI audio
+Recapture README images after UI changes:
 
 ```powershell
-python -m app.audio.engine --single-drop --surface water --size-mm 3.5
-python -m app.audio.engine --render 120 --seconds 4 --intensity 0.35 --out out/rain.wav
-python scripts/gen_rain_samples.py
+python scripts/capture_screenshots.py
 ```
 
 ---
 
 ## Releases
 
-See **[Releases](https://github.com/Stelliro/RainRoom3D/releases)** for tagged source packages.
+See **[Releases](https://github.com/Stelliro/RainRoom3D/releases)** for source packages.
 
-A Windows folder build (when present) is built with PyInstaller via:
+Optional local Windows folder build:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_release.ps1
 ```
-
-Output lands under `dist/RainRoom3D/` (gitignored). Prefer running from source if the frozen build is missing or outdated.
 
 ---
 
@@ -140,8 +128,8 @@ Output lands under `dist/RainRoom3D/` (gitignored). Prefer running from source i
 | Allowed | Not allowed |
 |---------|-------------|
 | Personal use, hobby, study | **Commercial use** |
-| Modify & share (keep notices) | Selling the software or making money from it / derivatives |
-| Research / noncommercial orgs (as defined in the license) | Sublicensing for commercial purposes |
+| Modify & share (keep notices) | Selling or monetizing this / derivatives |
+| Research / noncommercial orgs (as defined) | Sublicensing for commercial purposes |
 
 **No one may use this project to make money.** Full text: [LICENSE](LICENSE).
 
@@ -149,4 +137,4 @@ Output lands under `dist/RainRoom3D/` (gitignored). Prefer running from source i
 
 ## Contributing / feedback
 
-This is a **WIP** personal project. Issues and noncommercial experiments are welcome. Please respect the noncommercial license.
+This is a **WIP** personal project. Issues and noncommercial experiments are welcome — please respect the noncommercial license.

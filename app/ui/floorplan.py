@@ -110,9 +110,13 @@ class FloorPlanCanvas(QtWidgets.QWidget):
     def paintEvent(self, _e):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
-        p.fillRect(self.rect(), QtGui.QColor("#0a1018"))
+        # Soft vignette backdrop
+        bg = QtGui.QLinearGradient(0, 0, 0, self.height())
+        bg.setColorAt(0.0, QtGui.QColor("#0b121a"))
+        bg.setColorAt(1.0, QtGui.QColor("#070b10"))
+        p.fillRect(self.rect(), bg)
         if not self.room:
-            p.setPen(QtGui.QColor("#6b7a90"))
+            p.setPen(QtGui.QColor("#64748b"))
             p.drawText(self.rect(), QtCore.Qt.AlignCenter, "No house loaded")
             return
 
@@ -193,20 +197,23 @@ class FloorPlanCanvas(QtWidgets.QWidget):
             min(x0, x1), min(y0, y1),
             abs(x1 - x0), abs(y1 - y0),
         )
-        # Floor fill
-        p.setBrush(QtGui.QColor("#1a2230"))
-        p.setPen(QtGui.QPen(QtGui.QColor("#5a7aa0"), 3))
-        p.drawRect(rect)
+        # Floor fill with soft interior gradient
+        floor = QtGui.QLinearGradient(rect.topLeft(), rect.bottomRight())
+        floor.setColorAt(0.0, QtGui.QColor("#1c2838"))
+        floor.setColorAt(1.0, QtGui.QColor("#152030"))
+        p.setBrush(floor)
+        p.setPen(QtGui.QPen(QtGui.QColor("#3d5a80"), 2))
+        p.drawRoundedRect(rect, 4, 4)
         # Interior floor hatch
-        p.setPen(QtGui.QPen(QtGui.QColor(70, 90, 120, 40), 1))
-        step = max(12, int(self._scale * 0.5))
+        p.setPen(QtGui.QPen(QtGui.QColor(90, 120, 160, 28), 1))
+        step = max(14, int(self._scale * 0.55))
         for i in range(int(rect.left()), int(rect.right()), step):
             p.drawLine(i, int(rect.top()), i, int(rect.bottom()))
 
         # Wall thickness visual
-        p.setPen(QtGui.QPen(QtGui.QColor("#8aa4c4"), 5))
+        p.setPen(QtGui.QPen(QtGui.QColor("#7eb0e0"), 5, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
         p.setBrush(QtCore.Qt.NoBrush)
-        p.drawRect(rect)
+        p.drawRoundedRect(rect, 4, 4)
 
         # Dimension labels
         p.setPen(QtGui.QColor("#6b7a90"))
