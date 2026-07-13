@@ -1,0 +1,146 @@
+{
+  "name": "Living Room",
+  "room": {
+    "width": 5.0,
+    "height": 2.6,
+    "depth": 4.0,
+    "terrain_size": 36.0,
+    "roof_material": "Tin Roof",
+    "wall_material": "Glass Window",
+    "name": "Living Room"
+  },
+  "listener": {
+    "x": 1.74375,
+    "y": 1.2,
+    "z": 2.90625,
+    "yaw": 0.0,
+    "pitch": 0.0,
+    "roll": 0.0,
+    "audio_device": null
+  },
+  "windows": [
+    {
+      "name": "North Window",
+      "wall": "north",
+      "offset": 0.3891965474843182,
+      "width": 1.9341069050313635,
+      "height": 0.5784318822372655,
+      "sill": 0.8969150595966141,
+      "open": 0.08,
+      "open_style": "awning",
+      "max_angle_deg": 70.0,
+      "hinge_side": "left",
+      "material": "Glass Window",
+      "custom_hinge": "left",
+      "custom_motion": "swing",
+      "custom_outward": true,
+      "custom_notes": "",
+      "x": 0.3891965474843182,
+      "z": 4.0
+    },
+    {
+      "name": "East Window",
+      "wall": "east",
+      "offset": 0.7098074831019296,
+      "width": 0.9606592961407687,
+      "height": 0.5845607798023023,
+      "sill": 1.6117112106059217,
+      "open": 0.15,
+      "open_style": "awning",
+      "max_angle_deg": 45.0,
+      "hinge_side": "left",
+      "material": "Glass Window",
+      "custom_hinge": "left",
+      "custom_motion": "swing",
+      "custom_outward": true,
+      "custom_notes": "",
+      "x": 5.0,
+      "z": 0.7098074831019296
+    },
+    {
+      "name": "Window 3",
+      "wall": "north",
+      "offset": 2.8446746965675707,
+      "width": 0.6191749283745,
+      "height": 1.0843699779996303,
+      "sill": 0.8695373145292473,
+      "open": 0.09,
+      "open_style": "awning",
+      "max_angle_deg": 75.0,
+      "hinge_side": "left",
+      "material": "Glass Window",
+      "custom_hinge": "left",
+      "custom_motion": "swing",
+      "custom_outward": true,
+      "custom_notes": "",
+      "x": 2.8446746965675707,
+      "z": 4.0
+    }
+  ],
+  "speakers": [
+    {
+      "name": "Speaker 1",
+      "x": 0.29375,
+      "y": 1.1,
+      "z": 3.66875,
+      "size": 0.32,
+      "material": null,
+      "audio_device": null,
+      "gain_db": 0.0,
+      "enabled": true,
+      "notes": ""
+    },
+    {
+      "name": "Speaker 2",
+      "x": 1.45625,
+      "y": 1.1,
+      "z": 3.65625,
+      "size": 0.32,
+      "material": null,
+      "audio_device": null,
+      "gain_db": 0.0,
+      "enabled": true,
+      "notes": ""
+    },
+    {
+      "name": "Speaker 3",
+      "x": 2.54375,
+      "y": 1.1,
+      "z": 3.65625,
+      "size": 0.32,
+      "material": null,
+      "audio_device": null,
+      "gain_db": 0.0,
+      "enabled": true,
+      "notes": ""
+    }
+  ],
+  "headphones_items": [
+    {
+      "name": "You",
+      "x": 1.74375,
+      "y": 1.5,
+      "z": 2.90625,
+      "material": null
+    }
+  ],
+  "headphones_mode": false,
+  "rain": {
+    "intensity": 0.36,
+    "wind": 0.0,
+    "wind_speed": 0.0,
+    "wind_direction_deg": 108.0,
+    "wind_vary_direction": false,
+    "wind_dir_range_deg": 45.0,
+    "wind_dir_interval_s": 10.0,
+    "wind_dir_slew_deg_s": 15.0,
+    "wind_vary_speed": false,
+    "wind_speed_range": 0.25,
+    "wind_speed_interval_s": 8.0,
+    "wind_speed_slew_per_s": 0.2,
+    "thunder": 0.1,
+    "droplet_density": 0.04,
+    "master_volume": 0.58
+  },
+  "master_volume": 0.58
+}

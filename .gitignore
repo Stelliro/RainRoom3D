@@ -1,15 +1,47 @@
-﻿# Python / venv
+# Python
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Node / Web (if applicable)
-node_modules/
+# Local runtime / scratch
+out/
+logs/
+*.log
+single_drop.wav
+rain_demo.wav
+impacts.json
 
-# OS junk
-thumbs.db
+# OS
+Thumbs.db
+Desktop.ini
 .DS_Store
+ehthumbs.db
 
-# Build outputs
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build / packaging
 dist/
 build/
+*.spec
+bin/
+*.exe
+!docs/media/**
+
+# Secrets / local overrides
+.env
+.env.*
