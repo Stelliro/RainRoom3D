@@ -120,9 +120,9 @@ def _tune_field(w: QtWidgets.QWidget) -> QtWidgets.QWidget:
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RainRoom3D — House · Speakers · Rain")
-        self.setMinimumSize(1280, 820)
-        self.resize(1480, 920)
+        self.setWindowTitle("RainRoom3D — Design · Speakers · Spatial rain")
+        self.setMinimumSize(1320, 860)
+        self.resize(1520, 960)
 
         self.room: Room = self._load_startup_preset()
         self.engine = SpatialRainEngine(self.room)
@@ -152,36 +152,52 @@ class Main(QtWidgets.QMainWindow):
         # ---- Sidebar ----
         side = QtWidgets.QFrame()
         side.setObjectName("Sidebar")
-        side.setFixedWidth(280)
+        side.setFixedWidth(288)
         side_lay = QtWidgets.QVBoxLayout(side)
-        side_lay.setContentsMargins(16, 18, 16, 16)
-        side_lay.setSpacing(8)
+        side_lay.setContentsMargins(18, 20, 18, 18)
+        side_lay.setSpacing(10)
 
+        brand = QtWidgets.QLabel("RAINROOM 3D")
+        brand.setObjectName("BrandMark")
         title = QtWidgets.QLabel("RainRoom")
         title.setObjectName("Title")
-        sub = QtWidgets.QLabel("Terrain · Speakers · Spatial rain")
+        sub = QtWidgets.QLabel("Design a house. Map speakers.\nHear outdoor rain in 3D.")
         sub.setObjectName("Subtitle")
+        sub.setWordWrap(True)
+        badge = QtWidgets.QLabel("WIP")
+        badge.setObjectName("Badge")
+        badge.setAlignment(QtCore.Qt.AlignCenter)
+        badge.setFixedWidth(48)
+        brand_row = QtWidgets.QHBoxLayout()
+        brand_row.addWidget(brand, 1)
+        brand_row.addWidget(badge, 0, QtCore.Qt.AlignTop)
+        side_lay.addLayout(brand_row)
         side_lay.addWidget(title)
         side_lay.addWidget(sub)
+        side_lay.addSpacing(4)
 
-        # Easy-to-find project / website link
-        self.btn_website = QtWidgets.QPushButton("🌐  Project page (GitHub)")
+        self.btn_website = QtWidgets.QPushButton("Open project page")
         self.btn_website.setObjectName("Primary")
         self.btn_website.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_website.setToolTip(PROJECT_URL)
         side_lay.addWidget(self.btn_website)
         self.lbl_url = QtWidgets.QLabel(
-            f'<a href="{PROJECT_URL}" style="color:#7dd3fc;">{PROJECT_URL.replace("https://", "")}</a>'
+            f'<a href="{PROJECT_URL}" style="color:#7dd3fc; text-decoration:none;">'
+            f'{PROJECT_URL.replace("https://", "")}</a>'
         )
         self.lbl_url.setObjectName("Subtitle")
         self.lbl_url.setOpenExternalLinks(True)
         self.lbl_url.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
         self.lbl_url.setWordWrap(True)
         side_lay.addWidget(self.lbl_url)
-        side_lay.addSpacing(8)
+        side_lay.addSpacing(6)
 
+        side_lay.addWidget(_section("Workflow"))
         self.nav = QtWidgets.QListWidget()
-        self.nav.setFixedHeight(132)
+        self.nav.setObjectName("NavList")
+        self.nav.setFixedHeight(148)
+        self.nav.setSpacing(2)
+        self.nav.setFocusPolicy(QtCore.Qt.NoFocus)
         for label in ("1  Design house", "2  Speakers", "3  Simulate rain"):
             self.nav.addItem(label)
         self.nav.setCurrentRow(0)
@@ -192,6 +208,7 @@ class Main(QtWidgets.QMainWindow):
         self.btn_load = QtWidgets.QPushButton("Load…")
         self.btn_save = QtWidgets.QPushButton("Save…")
         self.btn_about = QtWidgets.QPushButton("About / help")
+        self.btn_about.setObjectName("Ghost")
         side_lay.addWidget(self.btn_new)
         side_lay.addWidget(self.btn_load)
         side_lay.addWidget(self.btn_save)
@@ -200,7 +217,7 @@ class Main(QtWidgets.QMainWindow):
         side_lay.addStretch(1)
 
         self.lbl_live = QtWidgets.QLabel("● Stopped")
-        self.lbl_live.setStyleSheet("color:#8b95a8;")
+        self.lbl_live.setObjectName("LiveIdle")
         side_lay.addWidget(self.lbl_live)
         self.btn_stop = QtWidgets.QPushButton("Stop audio")
         self.btn_stop.setObjectName("Danger")
@@ -210,18 +227,20 @@ class Main(QtWidgets.QMainWindow):
 
         # ---- Main column ----
         main_col = QtWidgets.QVBoxLayout()
-        main_col.setContentsMargins(14, 14, 14, 14)
-        main_col.setSpacing(10)
+        main_col.setContentsMargins(18, 16, 16, 14)
+        main_col.setSpacing(12)
         root_lay.addLayout(main_col, 1)
 
         # Header
         head = QtWidgets.QHBoxLayout()
+        head.setSpacing(12)
         self.lbl_step = QtWidgets.QLabel("Design your house on the terrain")
         self.lbl_step.setObjectName("Title")
         head.addWidget(self.lbl_step, 1)
-        self.view_tabs = QtWidgets.QTabWidget()
-        self.view_tabs.setDocumentMode(True)
-        head.addWidget(QtWidgets.QLabel(""))  # spacer placeholder
+        self.lbl_step_sub = QtWidgets.QLabel("Floor plan · 3D preview · inspector")
+        self.lbl_step_sub.setObjectName("Subtitle")
+        self.lbl_step_sub.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        head.addWidget(self.lbl_step_sub, 0)
         main_col.addLayout(head)
 
         # Splitter: canvas | inspector
@@ -235,10 +254,11 @@ class Main(QtWidgets.QMainWindow):
         view_lay.setSpacing(6)
 
         # Tool bar for design
-        self.tool_bar = QtWidgets.QWidget()
+        self.tool_bar = QtWidgets.QFrame()
+        self.tool_bar.setObjectName("ToolBar")
         tb = QtWidgets.QHBoxLayout(self.tool_bar)
-        tb.setContentsMargins(0, 0, 0, 0)
-        tb.setSpacing(6)
+        tb.setContentsMargins(10, 8, 10, 8)
+        tb.setSpacing(8)
         self.tool_btns = {}
         for key, label in (
             (TOOL_SELECT, "Select"),
@@ -309,13 +329,19 @@ class Main(QtWidgets.QMainWindow):
         split.addWidget(view_wrap)
 
         # Inspector stack (per workflow step) — scrollable so fields never pile up
+        insp_wrap = QtWidgets.QFrame()
+        insp_wrap.setObjectName("InspectorChrome")
+        insp_lay = QtWidgets.QVBoxLayout(insp_wrap)
+        insp_lay.setContentsMargins(10, 10, 10, 10)
+        insp_lay.setSpacing(0)
         self.inspector = QtWidgets.QStackedWidget()
         self.inspector.setMinimumWidth(360)
-        self.inspector.setMaximumWidth(460)
-        split.addWidget(self.inspector)
+        self.inspector.setMaximumWidth(480)
+        insp_lay.addWidget(self.inspector)
+        split.addWidget(insp_wrap)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 1)
-        split.setSizes([980, 420])
+        split.setSizes([1000, 440])
 
         self.inspector.addWidget(self._build_design_panel())
         self.inspector.addWidget(self._build_speakers_panel())
@@ -881,7 +907,15 @@ class Main(QtWidgets.QMainWindow):
             "Connect & place speakers",
             "Simulate outdoor rain through your layout",
         )
-        self.lbl_step.setText(titles[max(0, min(2, row))])
+        subs = (
+            "Windows · materials · selection inspector",
+            "OS devices · map outputs · test tones",
+            "Quantity · sharpness · wind · play modes",
+        )
+        i = max(0, min(2, row))
+        self.lbl_step.setText(titles[i])
+        if hasattr(self, "lbl_step_sub"):
+            self.lbl_step_sub.setText(subs[i])
         self.tool_bar.setVisible(row == 0)
         if row == 1:
             self._set_tool(TOOL_SPEAKER)
@@ -1770,7 +1804,9 @@ class Main(QtWidgets.QMainWindow):
             self.engine.start(include_you=False)
             self._play_mode = "multi"
             self.lbl_live.setText("● Mapped speakers only")
-            self.lbl_live.setStyleSheet("color:#4ade80;")
+            self.lbl_live.setObjectName("LiveOk")
+            self.lbl_live.style().unpolish(self.lbl_live)
+            self.lbl_live.style().polish(self.lbl_live)
             n = len(self.room.assigned_speakers())
             devs = sorted({int(s.audio_device) for s in self.room.assigned_speakers()})
             self.statusBar().showMessage(
@@ -1789,7 +1825,9 @@ class Main(QtWidgets.QMainWindow):
             self.engine.start(include_you=True, headphones_device=hp)
             self._play_mode = "all"
             self.lbl_live.setText("● You + speakers")
-            self.lbl_live.setStyleSheet("color:#a3e635;")
+            self.lbl_live.setObjectName("LiveOk")
+            self.lbl_live.style().unpolish(self.lbl_live)
+            self.lbl_live.style().polish(self.lbl_live)
             n = len(self.room.assigned_speakers())
             hp_tag = f"dev {hp}" if hp is not None else "system default"
             self.statusBar().showMessage(
@@ -1806,7 +1844,9 @@ class Main(QtWidgets.QMainWindow):
             self.engine.start_headphones(headphones_device=hp)
             self._play_mode = "headphones"
             self.lbl_live.setText("● You only")
-            self.lbl_live.setStyleSheet("color:#38bdf8;")
+            self.lbl_live.setObjectName("LiveOk")
+            self.lbl_live.style().unpolish(self.lbl_live)
+            self.lbl_live.style().polish(self.lbl_live)
             hp_tag = f"device {hp}" if hp is not None else "system default"
             self.statusBar().showMessage(
                 f"You only → headphones on {hp_tag}. Mapped room speakers silent."
@@ -1821,7 +1861,9 @@ class Main(QtWidgets.QMainWindow):
             pass
         self._play_mode = None
         self.lbl_live.setText("● Stopped")
-        self.lbl_live.setStyleSheet("color:#8b95a8;")
+        self.lbl_live.setObjectName("LiveIdle")
+        self.lbl_live.style().unpolish(self.lbl_live)
+        self.lbl_live.style().polish(self.lbl_live)
         self.statusBar().showMessage("Audio stopped")
 
     # ==================================================================
