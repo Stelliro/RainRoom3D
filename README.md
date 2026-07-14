@@ -112,12 +112,20 @@ python scripts/capture_screenshots.py
 
 ## Releases
 
-See **[Releases](https://github.com/Stelliro/RainRoom3D/releases)** for source packages.
+See **[Releases](https://github.com/Stelliro/RainRoom3D/releases)** for **source** and optional **Windows portable** zips.
 
-Optional local Windows folder build:
+Local Windows portable build (lean — excludes CUDA / ML packages that may sit in a global Python env):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_release.ps1
+# → dist/RainRoom3D/RainRoom3D.exe
+# → dist/RainRoom3D-windows-portable.zip
+```
+
+Source-only zip:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package_source_zip.ps1
 ```
 
 ---
