@@ -9,6 +9,10 @@ from typing import Any, Dict
 from app.models.room import (
     Headphones,
     Listener,
+    MIX_DROPLETS_RECOMMENDED,
+    MIX_REVERB_RECOMMENDED,
+    MIX_WASH_RECOMMENDED,
+    MIX_WIND_RECOMMENDED,
     Room,
     Speaker,
     Window,
@@ -17,12 +21,16 @@ from app.models.room import (
 
 
 def _speaker_from_dict(d: Dict[str, Any]) -> Speaker:
+    size = float(d.get("size", 0.32))
     return Speaker(
         name=d.get("name", "Speaker"),
         x=float(d.get("x", 1.0)),
         y=float(d.get("y", 1.1)),
         z=float(d.get("z", 1.0)),
-        size=float(d.get("size", 0.32)),
+        size=size,
+        width=float(d.get("width", 0.0)),
+        height=float(d.get("height", 0.0)),
+        depth=float(d.get("depth", 0.0)),
         material=d.get("material"),
         audio_device=d.get("audio_device"),
         gain_db=float(d.get("gain_db", 0.0)),
@@ -53,6 +61,10 @@ def _window_from_dict(d: Dict[str, Any]) -> Window:
         custom_motion=str(d.get("custom_motion", "swing")),
         custom_outward=bool(d.get("custom_outward", True)),
         custom_notes=str(d.get("custom_notes", "")),
+        free_place=bool(d.get("free_place", False)),
+        free_x=float(d.get("free_x", d.get("x", 0.0))),
+        free_y=float(d.get("free_y", float(d.get("sill", 0.9)) + 0.5 * float(d.get("height", 1.2)))),
+        free_z=float(d.get("free_z", d.get("z", 0.0))),
         x=float(d.get("x", 0.0)),
         z=float(d.get("z", 0.0)),
     )
@@ -113,6 +125,24 @@ def load_room(path: str) -> Room:
         wind_speed_range=float(rain.get("wind_speed_range", 0.25)),
         wind_speed_interval_s=float(rain.get("wind_speed_interval_s", 8.0)),
         wind_speed_slew_per_s=float(rain.get("wind_speed_slew_per_s", 0.20)),
+        mix_wash=float(
+            rain.get("mix_wash", data.get("mix", {}).get("wash", MIX_WASH_RECOMMENDED))
+        ),
+        mix_droplets=float(
+            rain.get(
+                "mix_droplets",
+                data.get("mix", {}).get("droplets", MIX_DROPLETS_RECOMMENDED),
+            )
+        ),
+        mix_reverb=float(
+            rain.get(
+                "mix_reverb",
+                data.get("mix", {}).get("reverb", MIX_REVERB_RECOMMENDED),
+            )
+        ),
+        mix_wind=float(
+            rain.get("mix_wind", data.get("mix", {}).get("wind", MIX_WIND_RECOMMENDED))
+        ),
     )
     # Legacy-only wind field (no speed/dir keys): map signed EW
     if "wind_speed" not in rain and "wind" in rain:
@@ -160,6 +190,10 @@ def save_room(room: Room, path: str) -> None:
                 "custom_motion": getattr(w, "custom_motion", "swing"),
                 "custom_outward": bool(getattr(w, "custom_outward", True)),
                 "custom_notes": getattr(w, "custom_notes", ""),
+                "free_place": bool(getattr(w, "free_place", False)),
+                "free_x": float(getattr(w, "free_x", w.x)),
+                "free_y": float(getattr(w, "free_y", w.sill + 0.5 * w.height)),
+                "free_z": float(getattr(w, "free_z", w.z)),
                 "x": w.x,
                 "z": w.z,
             }
@@ -172,6 +206,9 @@ def save_room(room: Room, path: str) -> None:
                 "y": s.y,
                 "z": s.z,
                 "size": float(getattr(s, "size", 0.32)),
+                "width": float(getattr(s, "width", 0.0) or 0.0),
+                "height": float(getattr(s, "height", 0.0) or 0.0),
+                "depth": float(getattr(s, "depth", 0.0) or 0.0),
                 "material": s.material,
                 "audio_device": s.audio_device,
                 "gain_db": s.gain_db,
@@ -198,8 +235,22 @@ def save_room(room: Room, path: str) -> None:
             "thunder": room.thunder,
             "droplet_density": room.droplet_density,
             "master_volume": float(getattr(room, "master_volume", 0.75)),
+            "mix_wash": float(getattr(room, "mix_wash", MIX_WASH_RECOMMENDED)),
+            "mix_droplets": float(getattr(room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)),
+            "mix_reverb": float(getattr(room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
+            "mix_wind": float(getattr(room, "mix_wind", MIX_WIND_RECOMMENDED)),
         },
         "master_volume": float(getattr(room, "master_volume", 0.75)),
+        # Flat mix block for easy hand-edit / share (same values as rain.*)
+        "mix": {
+            "wash": float(getattr(room, "mix_wash", MIX_WASH_RECOMMENDED)),
+            "droplets": float(getattr(room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)),
+            "reverb": float(getattr(room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
+            "wind": float(getattr(room, "mix_wind", MIX_WIND_RECOMMENDED)),
+            "master": float(getattr(room, "master_volume", 0.75)),
+            "quantity": float(getattr(room, "droplet_density", 0.55)),
+            "sharpness": float(getattr(room, "rain_intensity", 0.35)),
+        },
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

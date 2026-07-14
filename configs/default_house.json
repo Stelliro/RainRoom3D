@@ -140,7 +140,20 @@
     "wind_speed_slew_per_s": 0.2,
     "thunder": 0.1,
     "droplet_density": 0.04,
-    "master_volume": 0.58
+    "master_volume": 0.58,
+    "mix_wash": 0.05,
+    "mix_droplets": 2.0,
+    "mix_reverb": 1.0,
+    "mix_wind": 1.0
   },
-  "master_volume": 0.58
+  "master_volume": 0.58,
+  "mix": {
+    "wash": 0.05,
+    "droplets": 2.0,
+    "reverb": 1.0,
+    "wind": 1.0,
+    "master": 0.58,
+    "quantity": 0.04,
+    "sharpness": 0.36
+  }
 }

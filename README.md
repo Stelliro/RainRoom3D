@@ -37,7 +37,7 @@ RainRoom3D is a personal **Windows** experiment for spatial outdoor rain. It is 
 |---------------------|-------------|
 | House / window / speaker editor | Rain timbre (wet vs wash) still tuning |
 | Binaural **You** + multi-device speakers | Multi-device depends on your OS devices |
-| Quantity · sharpness · volume · wind | OpenGL vs software 3D varies by GPU |
+| Quantity · sharpness · volume · wind · **sound mix** | OpenGL vs software 3D varies by GPU |
 | Default Living Room layout | No first-class macOS / Linux support |
 
 ---
@@ -48,6 +48,7 @@ RainRoom3D is a personal **Windows** experiment for spatial outdoor rain. It is 
 - Place **You** (binaural listener) and **speakers**, assign real OS output devices  
 - **Simulate** outdoor rain: continuous wash + soft wet impacts, depth layers (near/mid/far/roof/canopy)  
 - Rain couples through **open windows** (distance, delay, air absorption)  
+- **Sound mix** prefs (wash · droplets · room echo · wind air) — saved with the house  
 - **Play as You**, **mapped speakers**, or **You + speakers**  
 - Optional rain loop WAVs in [`assets/audio/rain/`](assets/audio/rain/)  
 
@@ -74,7 +75,7 @@ Or double-click **`run.bat`**.
 
 1. App loads **Living Room** by default  
 2. Open a window a little in the inspector  
-3. Quantity ~**4%**, Volume ~**58%**, set Sharpness to taste  
+3. Quantity · Volume · Sharpness on **Simulate**; optional balance on **Sound mix**  
 4. **Play as You** with headphones  
 
 ---

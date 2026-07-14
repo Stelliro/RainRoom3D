@@ -32,6 +32,10 @@ from app.models.room import (
     WINDOW_STYLE_LABELS,
     CUSTOM_HINGES,
     CUSTOM_MOTIONS,
+    MIX_DROPLETS_RECOMMENDED,
+    MIX_REVERB_RECOMMENDED,
+    MIX_WASH_RECOMMENDED,
+    MIX_WIND_RECOMMENDED,
     default_house,
     place_speakers_evenly,
 )
@@ -195,10 +199,15 @@ class Main(QtWidgets.QMainWindow):
         side_lay.addWidget(_section("Workflow"))
         self.nav = QtWidgets.QListWidget()
         self.nav.setObjectName("NavList")
-        self.nav.setFixedHeight(148)
+        self.nav.setFixedHeight(188)
         self.nav.setSpacing(2)
         self.nav.setFocusPolicy(QtCore.Qt.NoFocus)
-        for label in ("1  Design house", "2  Speakers", "3  Simulate rain"):
+        for label in (
+            "1  Design house",
+            "2  Speakers",
+            "3  Simulate rain",
+            "4  Sound mix",
+        ):
             self.nav.addItem(label)
         self.nav.setCurrentRow(0)
         side_lay.addWidget(self.nav)
@@ -346,6 +355,7 @@ class Main(QtWidgets.QMainWindow):
         self.inspector.addWidget(self._build_design_panel())
         self.inspector.addWidget(self._build_speakers_panel())
         self.inspector.addWidget(self._build_sim_panel())
+        self.inspector.addWidget(self._build_mix_panel())
 
         self._set_tool(TOOL_SELECT)
 
@@ -455,16 +465,28 @@ class Main(QtWidgets.QMainWindow):
         self.sel_custom_notes.setPlaceholderText("Describe your window (optional)")
 
         # --- Speaker-only fields ---
-        self.sel_spk_size = _tune_field(QtWidgets.QDoubleSpinBox())
-        self.sel_spk_size.setRange(0.12, 1.2)
-        self.sel_spk_size.setDecimals(2)
-        self.sel_spk_size.setSuffix(" m")
-        self.sel_spk_size.setToolTip("Speaker box size in 3D (edge length)")
+        self.sel_spk_w = _tune_field(QtWidgets.QDoubleSpinBox())
+        self.sel_spk_w.setRange(0.12, 2.5)
+        self.sel_spk_w.setDecimals(2)
+        self.sel_spk_w.setSuffix(" m")
+        self.sel_spk_w.setToolTip("Width / horizontal span — wide = soundbar range")
+        self.sel_spk_h = _tune_field(QtWidgets.QDoubleSpinBox())
+        self.sel_spk_h.setRange(0.08, 2.0)
+        self.sel_spk_h.setDecimals(2)
+        self.sel_spk_h.setSuffix(" m")
+        self.sel_spk_h.setToolTip("Vertical size of the cabinet")
+        self.sel_spk_d = _tune_field(QtWidgets.QDoubleSpinBox())
+        self.sel_spk_d.setRange(0.06, 1.2)
+        self.sel_spk_d.setDecimals(2)
+        self.sel_spk_d.setSuffix(" m")
+        self.sel_spk_d.setToolTip("Depth / thickness of the cabinet")
+        # Keep legacy single-size control aliased to max dim for older code paths
+        self.sel_spk_size = self.sel_spk_w
         self.sel_spk_y = _tune_field(QtWidgets.QDoubleSpinBox())
         self.sel_spk_y.setRange(0.1, 3.5)
         self.sel_spk_y.setDecimals(2)
         self.sel_spk_y.setSuffix(" m")
-        self.sel_spk_y.setToolTip("Speaker height above floor")
+        self.sel_spk_y.setToolTip("Speaker center height above floor")
 
         self.sel_acoustics = QtWidgets.QLabel("")
         self.sel_acoustics.setObjectName("Subtitle")
@@ -514,8 +536,16 @@ class Main(QtWidgets.QMainWindow):
         self.sel_name_spk.setClearButtonEnabled(True)
         self.sel_name_spk.setPlaceholderText("Speaker name")
         spk_form.addRow("Name", self.sel_name_spk)
-        spk_form.addRow("Size", self.sel_spk_size)
-        spk_form.addRow("Height", self.sel_spk_y)
+        spk_form.addRow("Width (range)", self.sel_spk_w)
+        spk_form.addRow("Cabinet H", self.sel_spk_h)
+        spk_form.addRow("Depth", self.sel_spk_d)
+        spk_form.addRow("Floor height", self.sel_spk_y)
+        tip_spk = QtWidgets.QLabel(
+            "Wide + flat ≈ soundbar (wide pickup). Tall/square ≈ point speaker."
+        )
+        tip_spk.setObjectName("Subtitle")
+        tip_spk.setWordWrap(True)
+        spk_form.addRow(tip_spk)
         self.sel_stack.addWidget(spk_page)
 
         # page 3 — You
@@ -800,6 +830,131 @@ class Main(QtWidgets.QMainWindow):
         lay.addStretch(1)
         return _scroll_panel(inner)
 
+    def _build_mix_panel(self) -> QtWidgets.QWidget:
+        """Permanent sound-mix preferences (saved with the house)."""
+        inner = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(inner)
+        lay.setContentsMargins(4, 4, 12, 16)
+        lay.setSpacing(10)
+
+        tip = QtWidgets.QLabel(
+            "Balance how the rain is mixed — your preference, saved with the house.\n"
+            "Play rain, move a fader, listen. 1.00× is neutral; recommended "
+            "starts soft wash under clear droplets."
+        )
+        tip.setObjectName("Subtitle")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        lay.addWidget(_section("Mix levels (0 … 2×)"))
+
+        def _mix_row(key: str, title: str, hint: str, getter) -> None:
+            box = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QVBoxLayout(box)
+            form.setContentsMargins(10, 14, 10, 10)
+            form.setSpacing(6)
+            lbl_hint = QtWidgets.QLabel(hint)
+            lbl_hint.setObjectName("Subtitle")
+            lbl_hint.setWordWrap(True)
+            form.addWidget(lbl_hint)
+            row = QtWidgets.QHBoxLayout()
+            sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            # 0..200 → 0.00..2.00
+            sld.setRange(0, 200)
+            sld.setValue(int(round(float(getter()) * 100)))
+            sld.setMinimumHeight(28)
+            val = QtWidgets.QLabel(f"{getter():.2f}×")
+            val.setMinimumWidth(48)
+            val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            row.addWidget(sld, 1)
+            row.addWidget(val)
+            form.addLayout(row)
+            lay.addWidget(box)
+            setattr(self, f"sld_mix_{key}", sld)
+            setattr(self, f"lbl_mix_{key}", val)
+
+        _mix_row(
+            "master",
+            "Master",
+            "Overall listen level (same as Volume on Simulate).",
+            lambda: float(getattr(self.room, "master_volume", 0.75)),
+        )
+        # Master uses 0..1 scale on room; map slider 0..100 for master only
+        self.sld_mix_master.setRange(0, 100)
+        self.sld_mix_master.setValue(
+            int(round(float(getattr(self.room, "master_volume", 0.75)) * 100))
+        )
+        self.lbl_mix_master.setText(
+            f"{float(getattr(self.room, 'master_volume', 0.75)):.0%}"
+        )
+
+        _mix_row(
+            "wash",
+            "Outdoor wash",
+            "Continuous soft rain background (not individual hits). "
+            f"Recommended {MIX_WASH_RECOMMENDED:.2f}× — low under droplets.",
+            lambda: float(getattr(self.room, "mix_wash", MIX_WASH_RECOMMENDED)),
+        )
+        _mix_row(
+            "droplets",
+            "Droplets",
+            "Pitter-patter hits. Raise if sparse rain feels empty. "
+            f"Recommended {MIX_DROPLETS_RECOMMENDED:.2f}×.",
+            lambda: float(getattr(self.room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)),
+        )
+        _mix_row(
+            "reverb",
+            "Room echo",
+            "Indoor bounce / space. 0 = dry, higher = more room. "
+            f"Recommended {MIX_REVERB_RECOMMENDED:.2f}×.",
+            lambda: float(getattr(self.room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
+        )
+        _mix_row(
+            "wind",
+            "Wind air",
+            "How loud outdoor wind is when Simulate → Wind speed is up. "
+            f"Recommended {MIX_WIND_RECOMMENDED:.2f}×. Silent when wind is off.",
+            lambda: float(getattr(self.room, "mix_wind", MIX_WIND_RECOMMENDED)),
+        )
+
+        lay.addWidget(_section("Save & share"))
+        self.btn_mix_copy = QtWidgets.QPushButton("Copy mix config")
+        self.btn_mix_copy.setObjectName("Primary")
+        self.btn_mix_copy.setToolTip(
+            "Copy mix JSON to the clipboard (handy for sharing your preference)"
+        )
+        self.btn_mix_reset = QtWidgets.QPushButton("Reset to recommended")
+        self.btn_mix_reset.setToolTip(
+            f"Wash {MIX_WASH_RECOMMENDED:.2f}× · Droplets {MIX_DROPLETS_RECOMMENDED:.2f}× · "
+            f"Echo {MIX_REVERB_RECOMMENDED:.2f}× · Wind {MIX_WIND_RECOMMENDED:.2f}× "
+            "(master volume unchanged)"
+        )
+        self.btn_mix_save = QtWidgets.QPushButton("Save house…")
+        self.btn_mix_save.setToolTip(
+            "Save the house JSON — mix levels are stored with the layout"
+        )
+        lay.addWidget(self.btn_mix_copy)
+        lay.addWidget(self.btn_mix_reset)
+        lay.addWidget(self.btn_mix_save)
+
+        self.txt_mix_out = QtWidgets.QPlainTextEdit()
+        self.txt_mix_out.setReadOnly(True)
+        self.txt_mix_out.setMaximumHeight(140)
+        self.txt_mix_out.setPlaceholderText("Copied mix JSON appears here…")
+        lay.addWidget(self.txt_mix_out)
+
+        help2 = QtWidgets.QLabel(
+            "Tips: set Master to a comfortable volume, then balance "
+            "Outdoor wash vs Droplets. Room echo last. "
+            "Wind air only matters when wind speed is above zero. "
+            "No music theory needed — just more / less."
+        )
+        help2.setObjectName("Subtitle")
+        help2.setWordWrap(True)
+        lay.addWidget(help2)
+        lay.addStretch(1)
+        return _scroll_panel(inner)
+
     # ==================================================================
     # Wiring
     # ==================================================================
@@ -863,7 +1018,9 @@ class Main(QtWidgets.QMainWindow):
         self.sel_custom_out.toggled.connect(self._apply_custom_out)
         self.sel_custom_notes.editingFinished.connect(self._apply_custom_notes)
         self.sel_custom_notes.returnPressed.connect(self._apply_custom_notes)
-        self.sel_spk_size.valueChanged.connect(self._apply_spk_size_panel)
+        self.sel_spk_w.valueChanged.connect(self._apply_spk_w_panel)
+        self.sel_spk_h.valueChanged.connect(self._apply_spk_h_panel)
+        self.sel_spk_d.valueChanged.connect(self._apply_spk_d_panel)
         self.sel_spk_y.valueChanged.connect(self._apply_spk_y_panel)
 
         self.btn_refresh_dev.clicked.connect(self._refresh_device_lists)
@@ -897,22 +1054,42 @@ class Main(QtWidgets.QMainWindow):
         self.btn_play_all.clicked.connect(self._play_all)
         self.btn_place_3.clicked.connect(self._place_three_speakers)
 
+        # Sound mix (permanent prefs)
+        self.sld_mix_master.valueChanged.connect(self._on_mix_master)
+        self.sld_mix_wash.valueChanged.connect(
+            lambda v: self._on_mix_fader("mix_wash", v, self.lbl_mix_wash)
+        )
+        self.sld_mix_droplets.valueChanged.connect(
+            lambda v: self._on_mix_fader("mix_droplets", v, self.lbl_mix_droplets)
+        )
+        self.sld_mix_reverb.valueChanged.connect(
+            lambda v: self._on_mix_fader("mix_reverb", v, self.lbl_mix_reverb)
+        )
+        self.sld_mix_wind.valueChanged.connect(
+            lambda v: self._on_mix_fader("mix_wind", v, self.lbl_mix_wind)
+        )
+        self.btn_mix_copy.clicked.connect(self._copy_mix_config)
+        self.btn_mix_reset.clicked.connect(self._reset_mix_defaults)
+        self.btn_mix_save.clicked.connect(self._save_house)
+
     # ==================================================================
     # Step / view
     # ==================================================================
     def _on_step(self, row: int):
-        self.inspector.setCurrentIndex(max(0, min(2, row)))
+        self.inspector.setCurrentIndex(max(0, min(3, row)))
         titles = (
             "Design your house on the terrain",
             "Connect & place speakers",
             "Simulate outdoor rain through your layout",
+            "Sound mix — balance wash, droplets, echo, wind",
         )
         subs = (
             "Windows · materials · selection inspector",
             "OS devices · map outputs · test tones",
             "Quantity · sharpness · wind · play modes",
+            "Saved with the house · reset to recommended anytime",
         )
-        i = max(0, min(2, row))
+        i = max(0, min(3, row))
         self.lbl_step.setText(titles[i])
         if hasattr(self, "lbl_step_sub"):
             self.lbl_step_sub.setText(subs[i])
@@ -924,6 +1101,9 @@ class Main(QtWidgets.QMainWindow):
         elif row == 2:
             self._set_tool(TOOL_SELECT)
             self._update_sim_status()
+        elif row == 3:
+            self._set_tool(TOOL_SELECT)
+            self._sync_mix_sliders()
         else:
             self._set_tool(TOOL_SELECT)
 
@@ -985,6 +1165,13 @@ class Main(QtWidgets.QMainWindow):
 
     def _set_tool(self, tool: str):
         self.floor.set_tool(tool)
+        if hasattr(self, "view3d") and hasattr(self.view3d, "set_tool"):
+            self.view3d.set_tool(tool)
+        if self.gl is not None and hasattr(self.gl, "set_tool"):
+            try:
+                self.gl.set_tool(tool)
+            except Exception:
+                pass
         for k, b in self.tool_btns.items():
             b.setChecked(k == tool)
             b.setObjectName("ToolActive" if k == tool else "")
@@ -1074,7 +1261,7 @@ class Main(QtWidgets.QMainWindow):
             self.sel_name, self.sel_name_spk, self.sel_open, self.sel_wall, self.sel_width,
             self.sel_height, self.sel_sill, self.sel_style, self.sel_angle, self.sel_hinge,
             self.sel_custom_hinge, self.sel_custom_motion, self.sel_custom_out, self.sel_custom_notes,
-            self.sel_spk_size, self.sel_spk_y,
+            self.sel_spk_w, self.sel_spk_h, self.sel_spk_d, self.sel_spk_y,
         ]
         for wdg in widgets:
             wdg.blockSignals(True)
@@ -1115,13 +1302,22 @@ class Main(QtWidgets.QMainWindow):
             self.sel_stack.setCurrentIndex(2)
             self.sel_name_spk.setEnabled(True)
             self.sel_name_spk.setText(s.name)
-            self.sel_spk_size.setEnabled(True)
+            self.sel_spk_w.setEnabled(True)
+            self.sel_spk_h.setEnabled(True)
+            self.sel_spk_d.setEnabled(True)
             self.sel_spk_y.setEnabled(True)
-            self.sel_spk_size.setValue(float(getattr(s, "size", 0.32)))
+            if hasattr(s, "box_dims"):
+                bw, bh, bd = s.box_dims()
+            else:
+                sz = float(getattr(s, "size", 0.32))
+                bw, bh, bd = sz, sz, min(sz, 0.22)
+            self.sel_spk_w.setValue(bw)
+            self.sel_spk_h.setValue(bh)
+            self.sel_spk_d.setValue(bd)
             self.sel_spk_y.setValue(float(s.y))
             self.sel_acoustics.setText(
-                f"3D: drag body to move · top (blue) height · green size\n"
-                f"Position ({s.x:.2f}, {s.y:.2f}, {s.z:.2f}) m"
+                f"3D: RGB arrows move · red W / green H / blue D resize\n"
+                f"Pos ({s.x:.2f}, {s.y:.2f}, {s.z:.2f}) · range~{max(bw, bd):.2f} m wide"
             )
         elif kind == "listener":
             self.sel_box.setTitle("You (headphones)")
@@ -1296,11 +1492,37 @@ class Main(QtWidgets.QMainWindow):
         w.custom_notes = self.sel_custom_notes.text().strip()
         self._touch_window(w)
 
-    def _apply_spk_size_panel(self, v: float):
+    def _apply_spk_w_panel(self, v: float):
         kind, idx = self._selected
         if kind != "speaker" or not (0 <= idx < len(self.room.speakers)):
             return
-        self.room.speakers[idx].size = float(v)
+        sp = self.room.speakers[idx]
+        if hasattr(sp, "materialize_dims"):
+            sp.materialize_dims()
+        sp.width = float(v)
+        sp.size = max(sp.width, float(sp.height or 0.1), float(sp.depth or 0.1))
+        self._refresh_views()
+
+    def _apply_spk_h_panel(self, v: float):
+        kind, idx = self._selected
+        if kind != "speaker" or not (0 <= idx < len(self.room.speakers)):
+            return
+        sp = self.room.speakers[idx]
+        if hasattr(sp, "materialize_dims"):
+            sp.materialize_dims()
+        sp.height = float(v)
+        sp.size = max(float(sp.width or 0.1), sp.height, float(sp.depth or 0.1))
+        self._refresh_views()
+
+    def _apply_spk_d_panel(self, v: float):
+        kind, idx = self._selected
+        if kind != "speaker" or not (0 <= idx < len(self.room.speakers)):
+            return
+        sp = self.room.speakers[idx]
+        if hasattr(sp, "materialize_dims"):
+            sp.materialize_dims()
+        sp.depth = float(v)
+        sp.size = max(float(sp.width or 0.1), float(sp.height or 0.1), sp.depth)
         self._refresh_views()
 
     def _apply_spk_y_panel(self, v: float):
@@ -1321,15 +1543,23 @@ class Main(QtWidgets.QMainWindow):
         # None = system default for You; unassigned for room speakers
         self.spk_device.addItem("— System default / unassigned —", userData=None)
         for d in devices:
-            host = d.get("hostapi_name") or ""
-            tag = f" · {host}" if host and host != "?" else ""
+            # Clean display: drop trailing "Windows WASAPI" etc. PortAudio often appends
+            import re
+            disp = re.sub(
+                r"\s*Windows\s+(WASAPI|DirectSound|MME|WDM-KS)\s*$",
+                "",
+                str(d.get("name", "?")),
+                flags=re.I,
+            ).strip()
             def_mark = " ★" if d.get("is_default") else ""
-            label = f"{d['name']}{def_mark}  ({d['channels']} ch){tag}"
+            label = f"{disp}{def_mark}  ({d['channels']} ch)"
             self.lst_devices.addItem(label)
             self.lst_devices.item(self.lst_devices.count() - 1).setData(QtCore.Qt.UserRole, d["index"])
             self.spk_device.addItem(label, userData=d["index"])
         self.spk_device.blockSignals(False)
-        self.statusBar().showMessage(f"Found {len(devices)} unique output device(s)")
+        self.statusBar().showMessage(
+            f"Found {len(devices)} output(s) — duplicates from MME/DirectSound hidden"
+        )
         # Keep field widgets in sync with selection
         if self._selected[0] == "listener":
             self._load_you_fields()
@@ -1706,7 +1936,9 @@ class Main(QtWidgets.QMainWindow):
             tag = "heavy rain"
         else:
             tag = "downpour"
-        return f"{int(q * 100)}%  ·  {tag}"
+        # Approximate droplet rate for the label (matches SpatialRainEngine._ips core)
+        approx_ips = 1.5 + 6.0 * q + 155.0 * (q ** 0.90)
+        return f"{int(q * 100)}%  ·  {tag}  ·  ~{approx_ips:.0f}/s"
 
     @staticmethod
     def _volume_label(v: float) -> str:
@@ -1727,12 +1959,93 @@ class Main(QtWidgets.QMainWindow):
         # droplet_density = quantity (continuous field mass + discrete accents)
         self.room.droplet_density = v / 100.0
         self.lbl_density.setText(self._quantity_label(self.room.droplet_density))
+
+    def _on_mix_master(self, v: int):
+        """Master 0..100 → 0..1; keep Simulate volume slider in sync."""
+        self.room.master_volume = max(0.0, min(1.0, v / 100.0))
+        self.lbl_mix_master.setText(f"{self.room.master_volume:.0%}")
+        self.engine.set_volume(self.room.master_volume)
+        if hasattr(self, "sld_volume"):
+            self.sld_volume.blockSignals(True)
+            self.sld_volume.setValue(int(round(self.room.master_volume * 100)))
+            self.sld_volume.blockSignals(False)
+            self.lbl_volume.setText(self._volume_label(self.room.master_volume))
+
+    def _on_mix_fader(self, attr: str, v: int, lbl: QtWidgets.QLabel):
+        """Generic 0..200 slider → 0.00..2.00× mix fader."""
+        x = max(0.0, min(2.0, v / 100.0))
+        setattr(self.room, attr, x)
+        lbl.setText(f"{x:.2f}×")
+
+    def _sync_mix_sliders(self):
+        if not hasattr(self, "sld_mix_wash"):
+            return
+        pairs = (
+            ("mix_wash", self.sld_mix_wash, self.lbl_mix_wash, MIX_WASH_RECOMMENDED),
+            ("mix_droplets", self.sld_mix_droplets, self.lbl_mix_droplets, MIX_DROPLETS_RECOMMENDED),
+            ("mix_reverb", self.sld_mix_reverb, self.lbl_mix_reverb, MIX_REVERB_RECOMMENDED),
+            ("mix_wind", self.sld_mix_wind, self.lbl_mix_wind, MIX_WIND_RECOMMENDED),
+        )
+        for attr, sld, lbl, default in pairs:
+            x = float(getattr(self.room, attr, default))
+            sld.blockSignals(True)
+            sld.setValue(int(round(x * 100)))
+            sld.blockSignals(False)
+            lbl.setText(f"{x:.2f}×")
+        mv = float(getattr(self.room, "master_volume", 0.75))
+        self.sld_mix_master.blockSignals(True)
+        self.sld_mix_master.setValue(int(round(mv * 100)))
+        self.sld_mix_master.blockSignals(False)
+        self.lbl_mix_master.setText(f"{mv:.0%}")
+
+    def _mix_config_dict(self) -> dict:
+        return {
+            "master": round(float(getattr(self.room, "master_volume", 0.75)), 3),
+            "wash": round(float(getattr(self.room, "mix_wash", MIX_WASH_RECOMMENDED)), 3),
+            "droplets": round(
+                float(getattr(self.room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)), 3
+            ),
+            "reverb": round(
+                float(getattr(self.room, "mix_reverb", MIX_REVERB_RECOMMENDED)), 3
+            ),
+            "wind": round(float(getattr(self.room, "mix_wind", MIX_WIND_RECOMMENDED)), 3),
+            "quantity": round(float(getattr(self.room, "droplet_density", 0.55)), 3),
+            "sharpness": round(float(getattr(self.room, "rain_intensity", 0.35)), 3),
+            "wall_material": str(getattr(self.room, "wall_material", "")),
+            "roof_material": str(getattr(self.room, "roof_material", "")),
+        }
+
+    def _copy_mix_config(self):
+        import json
+        text = json.dumps(self._mix_config_dict(), indent=2)
+        self.txt_mix_out.setPlainText(text)
+        QtWidgets.QApplication.clipboard().setText(text)
+        self.statusBar().showMessage("Mix config copied to clipboard", 4000)
+
+    def _reset_mix_defaults(self):
+        """Restore recommended mix (does not change master volume)."""
+        self.room.mix_wash = MIX_WASH_RECOMMENDED
+        self.room.mix_droplets = MIX_DROPLETS_RECOMMENDED
+        self.room.mix_reverb = MIX_REVERB_RECOMMENDED
+        self.room.mix_wind = MIX_WIND_RECOMMENDED
+        self._sync_mix_sliders()
+        self.statusBar().showMessage(
+            f"Mix reset to recommended: wash {MIX_WASH_RECOMMENDED:.2f} · "
+            f"droplets {MIX_DROPLETS_RECOMMENDED:.2f} · "
+            f"echo/wind {MIX_REVERB_RECOMMENDED:.2f} (master unchanged)",
+            3500,
+        )
         self.view3d.update()
 
     def _on_volume(self, v: int):
         self.room.master_volume = max(0.0, min(1.0, v / 100.0))
         self.engine.set_volume(self.room.master_volume)
         self.lbl_volume.setText(self._volume_label(self.room.master_volume))
+        if hasattr(self, "sld_mix_master"):
+            self.sld_mix_master.blockSignals(True)
+            self.sld_mix_master.setValue(int(round(self.room.master_volume * 100)))
+            self.sld_mix_master.blockSignals(False)
+            self.lbl_mix_master.setText(f"{self.room.master_volume:.0%}")
 
     def _update_sim_status(self):
         assigned = self.room.assigned_speakers()
@@ -1950,6 +2263,7 @@ class Main(QtWidgets.QMainWindow):
         self._sync_wind_vary_enabled()
         self.engine.set_volume(vol)
         self.floor.set_room(self.room)
+        self._sync_mix_sliders()
 
     def _load_house(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -2013,8 +2327,9 @@ class Main(QtWidgets.QMainWindow):
             "and simulate 3D outdoor rain through your windows.</p>"
             f'<p><b>Project page:</b><br>'
             f'<a href="{PROJECT_URL}">{PROJECT_URL}</a></p>'
-            "<p><b>How to listen in 3D:</b> use "
-            "<i>3D binaural (headphones)</i> on a stereo headphone output.</p>"
+            "<p><b>How to listen in 3D:</b> Play as You on a stereo headphone output.</p>"
+            "<p><b>Sound mix:</b> step 4 balances wash, droplets, room echo, "
+            "and wind — saved with your house.</p>"
         )
         box.setStandardButtons(QtWidgets.QMessageBox.Ok)
         open_btn = box.addButton("Open project page", QtWidgets.QMessageBox.ActionRole)
