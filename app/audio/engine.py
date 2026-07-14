@@ -542,86 +542,90 @@ def _offtone_freqs(surface, size_mm, seed):
 
 
 def _mk_wet_spit(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db=-4.0):
-    """Heavy soft wet splat — unpitched, no sine pop, no hollow mid ring.
+    """Soft wet water hit — brown-led, dark, no high tarp/plastic.
 
-    Real light rain hits are soft broadband mass, not little tonal pops.
-      • low brown *weight* (the mass of the drop)
-      • wider mid *wet smear* (splash, still noise)
-      • optional soft high *sheen* from sharpness only
-    Zero free sines. Zero cavity resonators.
+    Avoids mid-pink “tarp slap” and bright HF tips that read as plastic.
+      • heavy brown *weight* (water mass)
+      • soft low-mid *wet smear* (splash, still dark)
+      • tiny sharpness sheen only (very quiet)
     """
     sh = max(0.0, min(1.0, float(sharpness)))
     wet = max(0.2, min(1.0, float(wetness)))
     size = max(0.35, float(size_mm))
     prof = _get_surface(surface)
+    # Surfaces that aren't water stay a touch brighter, but never tarp-bright
+    bright = float(prof.get("brightness", 0.22))
+    mat = max(0.0, min(1.0, bright))
 
-    # Slow attack kills the "pop"; longer body = weight, not a hollow click
-    attack = 5.5 + 2.0 * wet - 1.5 * sh          # ~4–7.5 ms
-    decay = 28.0 + 22.0 * wet * (size / 2.5) - 6.0 * sh
-    decay = max(20.0, min(70.0, decay))
-    n = max(160, int(sr * (attack + decay + 4.0) / 1000.0))
+    # Slow soft attack — no needle / plastic tick
+    attack = 6.5 + 2.5 * wet - 1.2 * sh          # ~5–9 ms
+    decay = 32.0 + 24.0 * wet * (size / 2.5) - 5.0 * sh
+    decay = max(24.0, min(80.0, decay))
+    n = max(192, int(sr * (attack + decay + 6.0) / 1000.0))
 
     white = _det_noise(n, seed * 1000 + 9)
     brown = _brownish(white)
     pink = _pinkish(white)
 
-    # --- weight: soft body (not sub-heavy) ---
-    weight = 0.82 * brown + 0.18 * pink
-    weight = _hp1(weight, 90.0 + 30.0 * sh, sr)          # cut boom
-    weight = _lp1(weight, 750.0 + 450.0 * sh + 60.0 * size, sr)
-    w_env = _soft_env(n, sr, attack_ms=attack + 1.0, decay_ms=decay * 0.95, hold_ms=1.5)
-    weight = _rms_scale(weight * w_env, 0.10)
+    # --- weight: brown water body (main character) ---
+    weight = (0.92 - 0.08 * mat) * brown + (0.08 + 0.08 * mat) * pink
+    weight = _hp1(weight, 45.0 + 25.0 * sh, sr)
+    # Keep body dark — high LP was the “tarp” zone
+    body_lp = 520.0 + 380.0 * sh + 40.0 * size + 120.0 * mat
+    weight = _lp1(weight, body_lp, sr)
+    w_env = _soft_env(n, sr, attack_ms=attack + 1.5, decay_ms=decay, hold_ms=2.0)
+    weight = _rms_scale(weight * w_env, 0.11)
 
-    # --- wet smear: mid presence (the “air” of the spit, still unpitched) ---
-    smear = 0.48 * brown + 0.52 * pink
-    smear = _hp1(smear, 220.0 + 80.0 * sh, sr)
-    mid_lo = 380.0 + 120.0 * sh
-    mid_hi = 1400.0 + 1600.0 * sh
+    # --- wet smear: soft low-mid only (not bright pink mid formant) ---
+    smear = 0.78 * brown + 0.22 * pink
+    smear = _hp1(smear, 90.0 + 40.0 * sh, sr)
+    mid_lo = 160.0 + 60.0 * sh
+    mid_hi = 700.0 + 550.0 * sh + 200.0 * mat   # was ~1400–3000 → tarp
     smear = _lp1(smear, mid_hi, sr)
     smear = _hp1(smear, mid_lo, sr)
-    s_att = attack + 1.0
-    s_dec = decay * (0.70 + 0.15 * wet)
-    s_env = _soft_env(n, sr, attack_ms=s_att, decay_ms=s_dec, hold_ms=1.2)
-    pre = min(n // 4, max(0, int(sr * (0.001 + 0.0015 * size))))
+    s_att = attack + 2.0
+    s_dec = decay * (0.80 + 0.12 * wet)
+    s_env = _soft_env(n, sr, attack_ms=s_att, decay_ms=s_dec, hold_ms=1.5)
+    pre = min(n // 4, max(0, int(sr * (0.002 + 0.001 * size))))
     smear_sig = np.zeros(n, dtype=np.float64)
-    body = _rms_scale(smear * s_env, 0.095)
+    body = _rms_scale(smear * s_env, 0.075)
     if pre > 0:
         smear_sig[pre:] = body[: n - pre]
     else:
         smear_sig = body
 
-    # --- sharpness sheen ---
+    # --- sharpness sheen: very quiet, dark-capped (not plastic tip) ---
     sheen = np.zeros(n, dtype=np.float64)
-    if sh > 0.08:
-        sh_n = min(n, max(48, int(sr * (0.010 + 0.020 * sh))))
+    if sh > 0.20:
+        sh_n = min(n, max(48, int(sr * (0.012 + 0.016 * sh))))
         tw = _det_noise(sh_n, seed * 1000 + 11)
-        tip = 0.50 * _brownish(tw) + 0.50 * _pinkish(tw)
-        tip = _hp1(tip, 1100.0 + 500.0 * sh, sr)
-        tip = _lp1(tip, 2800.0 + 2800.0 * sh, sr)
-        tip *= _soft_env(sh_n, sr, attack_ms=3.0 + 1.2 * sh, decay_ms=9.0 + 11.0 * sh, hold_ms=0.6)
-        tip = _rms_scale(tip, 0.032 + 0.030 * sh)
-        off = min(n // 5, max(0, int(0.0015 * sr)))
+        tip = 0.75 * _brownish(tw) + 0.25 * _pinkish(tw)
+        tip = _hp1(tip, 500.0 + 300.0 * sh, sr)
+        tip = _lp1(tip, 1400.0 + 1200.0 * sh, sr)  # hard ceiling vs old 2.8–5.6 kHz
+        tip *= _soft_env(sh_n, sr, attack_ms=4.0 + 1.5 * sh, decay_ms=12.0 + 10.0 * sh, hold_ms=0.8)
+        tip = _rms_scale(tip, 0.018 + 0.016 * sh)
+        off = min(n // 5, max(0, int(0.002 * sr)))
         take = min(sh_n, n - off)
         if take > 0:
             sheen[off : off + take] = tip[:take]
 
-    # Balanced lift from the too-deep pass: mid-led, not bright hash
-    sheen_g = (0.10 + 0.22 * sh) * min(1.0, 0.6 + 0.4 * size / 1.8)
-    out = 0.48 * weight + 0.52 * smear_sig + sheen_g * sheen
+    # Weight leads — water mass, not mid formant
+    sheen_g = (0.04 + 0.10 * sh) * min(1.0, 0.5 + 0.5 * size / 2.0)
+    out = 0.68 * weight + 0.30 * smear_sig + sheen_g * sheen
 
-    # Mild boom cut only
-    out = _hp1(out, 55.0 + 20.0 * sh, sr)
+    # Keep wet and dark overall
+    out = _hp1(out, 40.0 + 15.0 * sh, sr)
+    out = _lp1(out, 1100.0 + 900.0 * sh + 300.0 * mat, sr)
 
-    edge = min(int(0.004 * sr), n // 5)
+    edge = min(int(0.005 * sr), n // 5)
     if edge > 1:
         w = 0.5 - 0.5 * np.cos(np.linspace(0, math.pi, edge))
         out[:edge] *= w
         out[-edge:] *= w[::-1]
 
-    out = _rms_scale(out, 0.11 + 0.02 * sh)
-    # Soft peak tame — keeps mass without light "pop" spikes
-    out = _peak_cap(out, 0.22)
-    return _db(amp_db) * (0.60 + 0.35 * (size / 2.5)) * out
+    out = _rms_scale(out, 0.10 + 0.015 * sh)
+    out = _peak_cap(out, 0.20)
+    return _db(amp_db) * (0.62 + 0.32 * (size / 2.5)) * out
 
 
 def _mk_hollow_splat(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db=-5.0):
@@ -823,11 +827,11 @@ def synth_drop(
         else:
             mono = mono[:n_want]
 
-    # Open a little vs deep-weight pass; sharpness still opens top
-    final_lp = (1300.0 + 2600.0 * (sh ** 1.0)) if not hollow else (2000.0 + 4000.0 * sh)
+    # Wet stays dark (high final LP was re-opening tarp HF). Hollow can be brighter.
+    final_lp = (1000.0 + 900.0 * sh) if not hollow else (1800.0 + 2800.0 * sh)
     mono = _lp1(mono, final_lp, sr)
     if not hollow:
-        mono = _hp1(mono, 55.0 + 15.0 * sh, sr)
+        mono = _hp1(mono, 40.0 + 12.0 * sh, sr)
     if hp_cut and hp_cut > 0:
         mono = _hp1(mono, float(hp_cut), sr)
 

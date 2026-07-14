@@ -430,7 +430,10 @@ class FloorPlanCanvas(QtWidgets.QWidget):
         if self.tool == TOOL_SPEAKER:
             if self.room.contains_point(wx, wz, margin=0.1):
                 n = len(self.room.speakers)
-                sp = Speaker(name=f"Speaker {n+1}", x=wx, y=1.1, z=wz)
+                sp = Speaker(
+                    name=f"Speaker {n+1}", x=wx, y=1.1, z=wz,
+                    width=0.45, height=0.28, depth=0.18, size=0.32,
+                )
                 self.room.speakers.append(sp)
                 self.set_selection("speaker", n)
                 self.roomChanged.emit()

@@ -34,7 +34,7 @@ try:
 except Exception:  # pragma: no cover
     sd = None
 
-from app.audio.engine import synth_drop, _db, ContinuousRainBed, _peak_cap
+from app.audio.engine import synth_drop, _db, _peak_cap
 from app.audio.field_bed import OutdoorFieldBed
 from app.audio.field_router import OutdoorFieldRouter
 from app.audio.reverb import MonoRoomReverb, StereoRoomReverb, room_reverb_from_layout
@@ -42,6 +42,7 @@ from app.audio.spatial import (
     render_drop_to_listener_binaural,
     render_drop_to_receiver_mono,
 )
+from app.audio.wind import WindAirSynth
 from app.models.room import Room, Speaker
 
 log = logging.getLogger("audio.spatial")
@@ -115,19 +116,64 @@ def _hostapi_score(hostapi_index: Optional[int], hostapis: list) -> int:
 
 
 def _norm_device_name(name: str) -> str:
+    """Normalize PortAudio device names so the same physical output collapses to one key."""
+    import re
     n = " ".join(str(name or "?").lower().split())
-    # Strip common host-api suffixes sounddevice sometimes appends
-    for junk in (" (wasapi)", " (directsound)", " (mme)", " (windows wdm-ks)"):
-        if n.endswith(junk):
-            n = n[: -len(junk)].strip()
+    # Host-API tags PortAudio often appends (space or parentheses)
+    n = re.sub(
+        r"[\s\-]*(?:\()?windows\s+(?:wasapi|directsound|mme|wdm\-?ks)(?:\))?$",
+        "",
+        n,
+    )
+    for junk in (
+        " (wasapi)",
+        " (directsound)",
+        " (mme)",
+        " (windows wdm-ks)",
+        " (wdm-ks)",
+        " (windows directsound)",
+        " (windows mme)",
+        " (windows wasapi)",
+        " windows wasapi",
+        " windows directsound",
+        " windows mme",
+        " - wasapi",
+        " - directsound",
+        " - mme",
+    ):
+        n = n.replace(junk, "")
+    # Mapper / primary aliases
+    n = n.replace("primary sound driver", "primary")
+    n = n.replace("microsoft sound mapper", "mapper")
+    n = n.replace("sound mapper", "mapper")
+    # Normalize Realtek-style noise: realtek(r) → realtek
+    n = n.replace("(r)", "").replace("®", "")
+    n = re.sub(r"\s+", " ", n).strip(" -")
     return n
 
 
+def _is_virtual_mapper_name(name: str) -> bool:
+    n = _norm_device_name(name)
+    if n in ("primary", "mapper", "?", ""):
+        return True
+    if "mapper" in n and "sound" in n:
+        return True
+    if n.startswith("primary "):
+        return True
+    return False
+
+
 def list_output_devices() -> List[dict]:
-    """List unique output devices (deduped by name, prefer WASAPI / CoreAudio)."""
+    """List unique physical outputs (dedupe MME/DS/WASAPI copies of the same device).
+
+    Windows PortAudio often exposes each endpoint 3× (MME + DirectSound + WASAPI).
+    Default: keep modern APIs only (WASAPI), then one entry per normalized name.
+    Set env RAINROOM_ALL_AUDIO_APIS=1 to list every host API again.
+    """
     if sd is None:
         return []
     try:
+        import os
         devs = sd.query_devices()
         try:
             hostapis = list(sd.query_hostapis())
@@ -143,10 +189,17 @@ def list_output_devices() -> List[dict]:
             ch = int(d.get("max_output_channels", 0) or 0)
             if ch < 1:
                 continue
+            name = str(d.get("name", "?") or "?")
+            if _is_virtual_mapper_name(name):
+                continue
             hai = d.get("hostapi")
+            score = _hostapi_score(hai, hostapis)
+            if default_out is not None and int(default_out) == i:
+                score += 50
+            score += min(ch, 8)
             raw.append({
                 "index": i,
-                "name": d.get("name", "?"),
+                "name": name,
                 "hostapi": hai,
                 "hostapi_name": (
                     hostapis[int(hai)].get("name", "?") if hai is not None and int(hai) < len(hostapis) else "?"
@@ -154,11 +207,21 @@ def list_output_devices() -> List[dict]:
                 "channels": ch,
                 "default_sr": d.get("default_samplerate", 48000),
                 "is_default": (default_out is not None and int(default_out) == i),
-                "_score": _hostapi_score(hai, hostapis) + (50 if default_out is not None and int(default_out) == i else 0) + min(ch, 8),
-                "_key": _norm_device_name(d.get("name", "?")),
+                "_score": score,
+                "_key": _norm_device_name(name),
             })
 
-        # Keep best entry per normalized name (WASAPI wins over MME/DirectSound)
+        if not raw:
+            return []
+
+        # Prefer modern APIs only (WASAPI / CoreAudio / Pulse) unless user opts out
+        prefer_modern = os.environ.get("RAINROOM_ALL_AUDIO_APIS", "0") != "1"
+        modern = [d for d in raw if d["_score"] >= 95]  # WASAPI=100, pulse=95
+        if prefer_modern and modern:
+            # If default is only on a legacy API, still keep modern list (open by index)
+            raw = modern
+
+        # Keep best entry per normalized name (highest score wins)
         best: Dict[str, dict] = {}
         for d in raw:
             k = d["_key"]
@@ -166,10 +229,31 @@ def list_output_devices() -> List[dict]:
             if prev is None or d["_score"] > prev["_score"]:
                 best[k] = d
 
-        outs = sorted(best.values(), key=lambda d: (-int(d.get("is_default")), d["name"].lower(), d["index"]))
+        # Second pass: drop near-duplicates where keys only differ by leading
+        # "2- " / "3- " PortAudio multi-adapter prefixes
+        import re
+        def _stem(k: str) -> str:
+            return re.sub(r"^\d+\-\s*", "", k).strip()
+
+        by_stem: Dict[str, dict] = {}
+        for d in best.values():
+            stem = _stem(d["_key"])
+            prev = by_stem.get(stem)
+            if prev is None or d["_score"] > prev["_score"]:
+                by_stem[stem] = d
+
+        outs = sorted(
+            by_stem.values(),
+            key=lambda d: (-int(d.get("is_default")), d["name"].lower(), d["index"]),
+        )
         for d in outs:
             d.pop("_score", None)
             d.pop("_key", None)
+        log.info(
+            "Output devices: %d unique (from PortAudio; modern_api_only=%s)",
+            len(outs),
+            prefer_modern,
+        )
         return outs
     except Exception as e:
         log.exception("device query failed: %s", e)
@@ -197,6 +281,30 @@ def _material_surface(name: Optional[str]) -> str:
         if key in low:
             return surf
     return "metal"
+
+
+def _wall_tone(name: Optional[str]) -> float:
+    """0..1 subtle brown-wash colour from house wall material (not a big EQ jump).
+
+    Lower = darker/heavier brown (brick, shingle). Higher = slightly more open
+    (glass, metal). Default mid.
+    """
+    if not name:
+        return 0.45
+    low = str(name).lower()
+    if "brick" in low:
+        return 0.22
+    if "shingle" in low:
+        return 0.30
+    if "wood" in low:
+        return 0.38
+    if "tile" in low:
+        return 0.42
+    if "glass" in low or "window" in low:
+        return 0.72
+    if "tin" in low or "metal" in low:
+        return 0.58
+    return 0.45
 
 
 def _add_1d(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -379,8 +487,8 @@ class SpatialRainEngine:
         self._hp_queue: Optional[queue.Queue] = None
         self._mode = "stopped"  # multi | headphones
         self.use_noise_bed = False
-        self._bed_water = ContinuousRainBed(sr=self.samplerate, seed=4242)
-        self._bed_roof = ContinuousRainBed(sr=self.samplerate, seed=7771)
+        # Outdoor wind / air (layered gusts — not pink static)
+        self._wind_air = WindAirSynth(sr=self.samplerate, seed=4242)
         # Continuous outdoor field (procedural + optional WAV samples)
         self.use_outdoor_field = True
         self._field = OutdoorFieldBed(sr=self.samplerate, seed=2024)
@@ -494,25 +602,37 @@ class SpatialRainEngine:
         self._wind_speed_eff = max(0.0, min(1.0, self._wind_speed_eff))
 
     def _ips(self) -> float:
-        """Discrete impacts per second — quantity primary, sharpness shapes density.
+        """Discrete droplet impacts per second — Quantity is the main control.
 
-        Soft rain → more light micro hits. Sharp → harder hits, still dense enough
-        to read as rain (not sparse taps). Wind modestly increases rate.
+        Quantity must clearly change how often you hear pitter-patter:
+          ~4%  → sparse drizzle
+          ~50% → steady rain
+          ~100% → dense
+        Sharpness only gently biases density; wind adds a little.
         """
         quantity = float(getattr(self.room, "droplet_density", 0.5))
         sh = self._sharpness()
         wabs = self._wind_speed()
         if quantity <= 0.0005:
             return 0.0
-        # Low quantity still needs a lively spit rate (user sweet-spot ~4%).
-        # Old power curve left ~3–4 hits/s at q=0.04 — felt “slow”.
-        # Floor + mild curve: ~18–25/s at 4%, ~55 at mid, cap ~95.
-        soft_boost = 1.08 - 0.12 * sh
-        floor = 10.0 + 6.0 * (1.0 - sh)   # soft rain → slightly denser light hits
-        body = 72.0 * (quantity ** 0.55)
-        win_boost = 1.0 + 0.03 * len(getattr(self.room, "windows", []) or [])
-        wind_boost = 1.0 + 0.28 * wabs
-        return float(min(95.0, (floor + body) * soft_boost * win_boost * wind_boost))
+        q = max(0.0, min(1.0, quantity))
+        # Near-linear in perception (power slightly under 1 keeps low end usable)
+        # q=0.04 → ~10/s, q=0.25 → ~45, q=0.55 → ~95, q=1 → ~165
+        soft_boost = 1.06 - 0.10 * sh
+        body = 155.0 * (q ** 0.90)
+        # Tiny floor so it never goes completely dead at very low q (except 0)
+        floor = 1.5 + 6.0 * q
+        win_boost = 1.0 + 0.025 * len(getattr(self.room, "windows", []) or [])
+        wind_boost = 1.0 + 0.22 * wabs
+        return float(min(170.0, (floor + body) * soft_boost * win_boost * wind_boost))
+
+    def _droplet_playback_rate(self, quantity: float) -> float:
+        """Subtle speed-up of each droplet grain as quantity rises.
+
+        ~1.00 at q=0, ~1.04 at mid, ~1.09 at full — noticeable, not cartoon.
+        """
+        q = max(0.0, min(1.0, float(quantity)))
+        return 1.0 + 0.09 * (q ** 0.85)
 
     def _pick_source_3d(self) -> Tuple[str, float, float, float, float]:
         """Orchestra of outdoor depth layers.
@@ -672,17 +792,65 @@ class SpatialRainEngine:
     def _surface_for_layer(self, layer: str) -> str:
         if layer == "roof":
             base = _material_surface(getattr(self.room, "roof_material", "Metal Roof"))
-            return "tile" if base == "metal" else base
-        # Default: soft wet water. Hollow tarp/shell are rare specials only.
+            # Soften metal roofs so they don't read as plastic tarp hits
+            return "shingle" if base == "metal" else base
+        # Outdoor rain mass is wet water. Tarp/shell only very rare accents.
         u = float(self._rng.rand())
-        if layer in ("canopy", "mid"):
-            tarp_p = 0.020 if layer == "canopy" else 0.010
-            shell_p = 0.010 if layer == "canopy" else 0.005
-            if u < tarp_p:
-                return "tarp"
-            if u < tarp_p + shell_p:
-                return "shell"
+        if layer == "canopy" and u < 0.008:
+            return "tarp"
+        if layer == "canopy" and u < 0.012:
+            return "shell"
         return "water"
+
+    def _speaker_receive(
+        self,
+        mono: np.ndarray,
+        src: Tuple[float, float, float],
+        spk: Speaker,
+        sr: int,
+        gain_scale: float,
+    ) -> np.ndarray:
+        """Mic field at a speaker; wide units sample along their width (soundbar)."""
+        cx, cy, cz = float(spk.x), float(spk.y), float(spk.z)
+        if hasattr(spk, "box_dims"):
+            bw, bh, bd = spk.box_dims()
+        else:
+            s = float(getattr(spk, "size", 0.32) or 0.32)
+            bw, bh, bd = s, s, min(s, 0.22)
+        # Horizontal range = max width/depth; tall thin boxes stay near point-source
+        span = max(bw, bd)
+        # 1 sample if <~0.3 m, up to 5 along the long axis
+        n = 1 if span < 0.28 else min(5, max(2, int(round(span / 0.28))))
+        if n <= 1:
+            return render_drop_to_receiver_mono(
+                self.room, mono, src, (cx, cy, cz), sr, gain_scale=gain_scale
+            )
+        # Sample along width (X) if width is the long axis, else along Z
+        along_x = bw >= bd
+        parts = []
+        max_len = 0
+        for i in range(n):
+            t = (i / (n - 1) - 0.5)  # -0.5 .. +0.5
+            if along_x:
+                px, py, pz = cx + t * bw, cy, cz
+            else:
+                px, py, pz = cx, cy, cz + t * bd
+            part = render_drop_to_receiver_mono(
+                self.room, mono, src, (px, py, pz), sr, gain_scale=gain_scale
+            )
+            parts.append(part)
+            max_len = max(max_len, len(part))
+        if max_len <= 0:
+            return np.zeros(0, dtype=np.float64)
+        acc = np.zeros(max_len, dtype=np.float64)
+        for part in parts:
+            if len(part) < max_len:
+                padded = np.zeros(max_len, dtype=np.float64)
+                padded[: len(part)] = part
+                acc += padded
+            else:
+                acc += part
+        return acc * (1.0 / float(n))
 
     def _spawn_event(self, schedule_delay_n: int = 0):
         """Spawn outdoor drop → couple through windows → speakers / ears.
@@ -707,8 +875,10 @@ class SpatialRainEngine:
         # High quantity slightly favors smaller drops (spray) unless sharp
         size *= 1.0 - 0.18 * q * (1.0 - 0.5 * sharp)
 
-        # Wind hardens impact timbre (not drop count alone)
+        # Wind hardens impact; sparse rain stays softer so single hits don't poke
         hit_sharp = max(0.0, min(1.0, sharp + 0.35 * wabs * (0.5 + 0.5 * sharp)))
+        # Low quantity → slightly duller grain (less “sharp/loud” isolated hits)
+        hit_sharp *= 0.72 + 0.28 * max(0.0, min(1.0, q)) ** 0.6
 
         # Skip new hits when voice pool is full — never hard-cut a playing voice
         voices_full = (
@@ -723,47 +893,64 @@ class SpatialRainEngine:
             sr=self.samplerate, surface=surface, size_mm=size,
             seed=self._evt_id, sharpness=hit_sharp,
         )
-        # De-click: minimum fade-in so path/HRTF edges never hard-start
-        fade_n = max(8, int(0.003 * self.samplerate))  # ~3 ms
+        # Quantity → slightly faster droplets (shorter grains, higher rate feel)
+        rate = self._droplet_playback_rate(q)
+        if rate > 1.002 and len(mono) > 32:
+            n_out = max(24, int(round(len(mono) / rate)))
+            if n_out != len(mono):
+                xp = np.arange(len(mono), dtype=np.float64)
+                xq = np.linspace(0.0, len(mono) - 1, n_out)
+                mono = np.interp(xq, xp, mono).astype(np.float64)
+        # De-click: longer fade when sparse so each hit is less clicky
+        fade_ms = 3.0 + 4.0 * (1.0 - max(0.0, min(1.0, q)))  # ~7 ms sparse → 3 ms dense
+        fade_n = max(8, int(fade_ms * 0.001 * self.samplerate))
         if len(mono) > fade_n:
             mono = mono.copy()
             mono[:fade_n] *= np.linspace(0.0, 1.0, fade_n, dtype=np.float64)
+            # Soft tail fade too at low quantity
+            if q < 0.35 and len(mono) > fade_n * 2:
+                mono[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float64)
 
-        # Discrete wet spits are the rain texture; field wash stays under them
-        dens_bal = 1.35 / math.sqrt(0.22 + 0.78 * max(0.04, q))
-        size_k = 0.60 + 0.55 * min(1.0, size / max(0.5, size_max))
-        amp = float(self._rng.uniform(0.70, 1.15)) * self._master * dens_bal * size_k
+        # Level: do NOT over-boost sparse hits (old dens_bal ~2.7× at 4% + mix 2× = poke)
+        # Gentle compensation only so low qty isn't tiny; high qty stays balanced
+        qq = max(0.02, min(1.0, q))
+        dens_bal = 0.92 + 0.28 * (1.0 - qq) ** 0.85   # ~1.20 at 4%, ~0.92 at 100%
+        size_k = 0.55 + 0.50 * min(1.0, size / max(0.5, size_max))
+        mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
+        # Soft-knee on mix_droplets so 2× isn't as aggressive on sparse single hits
+        mix_d_eff = mix_d ** (0.92 if qq > 0.4 else 0.78)
+        amp = float(self._rng.uniform(0.65, 1.05)) * self._master * dens_bal * size_k * mix_d_eff
         # Hollow specials a touch quieter so they don't steal the mix
         if surface in ("tarp", "shell", "plastic", "hollow"):
             amp *= 0.78
         if layer == "far":
-            amp *= 0.35
+            amp *= 0.32
         elif layer == "mid":
-            amp *= 0.78
+            amp *= 0.72
         elif layer == "roof":
-            amp *= 0.58 + 0.12 * wabs
+            amp *= 0.55 + 0.12 * wabs
         elif layer == "canopy":
-            amp *= 0.48 + 0.10 * wabs
+            amp *= 0.45 + 0.10 * wabs
         elif layer == "near":
-            amp *= 1.15 + 0.18 * wabs
-        amp *= 0.68 + 0.28 * sharp
-        amp *= 0.75 + 0.40 * wabs
+            amp *= 1.05 + 0.15 * wabs
+        amp *= 0.65 + 0.25 * sharp
+        # Wind hits harder; mix_wind scales how much that matters (Sound mix)
+        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
+        amp *= 0.78 + 0.35 * wabs * (0.35 + 0.65 * min(1.5, mix_wind))
         mono = mono * amp
         self._evt_id += 1
         src = (x, y, z)
         sr = self.samplerate
 
         # ---- Each speaker = mic in the room relative to the windows ----
+        # Wide speakers (soundbars) sample multiple points along their width.
         taps: List[Tuple[int, np.ndarray, int]] = []
         if len(self._voices) < self.max_voices:
             for i, spk in enumerate(self.room.speakers):
                 if not getattr(spk, "enabled", True):
                     continue
-                recv = (float(spk.x), float(spk.y), float(spk.z))
                 g_user = _db(float(getattr(spk, "gain_db", 0.0) or 0.0))
-                acc = render_drop_to_receiver_mono(
-                    self.room, mono, src, recv, sr, gain_scale=g_user
-                )
+                acc = self._speaker_receive(mono, src, spk, sr, g_user)
                 if float(np.max(np.abs(acc))) < 1e-7:
                     continue
                 if schedule_delay_n > 0:
@@ -781,6 +968,9 @@ class SpatialRainEngine:
                 self.room, mono, src, recv, yaw, sr
             )
             if float(np.max(np.abs(stereo))) > 1e-7:
+                # Headphones need strong droplet presence vs continuous wash
+                # (speakers already read drops; You was ocean/static without this)
+                stereo = stereo * 2.65
                 if schedule_delay_n > 0:
                     pad = np.zeros((schedule_delay_n, 2), dtype=np.float64)
                     stereo = np.vstack([pad, stereo])
@@ -839,7 +1029,12 @@ class SpatialRainEngine:
             open_avg=self._open_avg(),
             sr=self.samplerate,
         )
-        self._reverb_stereo.set_params(room_size=size, damping=damp, wet=wet)
+        mix_r = max(0.0, min(2.5, float(getattr(self.room, "mix_reverb", 1.0))))
+        wet = max(0.0, min(0.85, wet * mix_r))
+        # Headphones: light reverb only — wet field + heavy reverb = ocean
+        self._reverb_stereo.set_params(
+            room_size=size, damping=min(0.97, damp + 0.12), wet=wet * 0.32
+        )
         for rev in self._reverb_mono.values():
             rev.set_params(room_size=size, damping=damp, wet=wet * 0.85)
 
@@ -849,12 +1044,21 @@ class SpatialRainEngine:
             return
         quantity = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
         sharp = self._sharpness()
-        # Wash under the wet key notes (splats) — not a loud noise blanket.
-        # Low quantity: very quiet field so off-tone spits read clearly.
+        # Wash under wet drops — not a loud noise blanket.
+        # Wall material gently colours the brown outdoor wash (subtle).
         q = max(0.0, min(1.0, quantity))
-        field_level = (0.006 + 0.11 * (q ** 0.95)) * self._master
+        mix_w = max(0.0, min(2.5, float(getattr(self.room, "mix_wash", 1.0))))
+        field_level = (0.006 + 0.11 * (q ** 0.95)) * self._master * mix_w
+        wt = _wall_tone(getattr(self.room, "wall_material", None))
+        # Roof contributes a little if walls are mid (outdoor mass includes roof plane)
+        rt = _wall_tone(getattr(self.room, "roof_material", None))
+        wall_tone = 0.72 * wt + 0.28 * rt
         layers = self._field.render_layers(
-            frames, quantity=quantity, sharpness=sharp, level=field_level
+            frames,
+            quantity=quantity,
+            sharpness=sharp,
+            level=field_level,
+            wall_tone=wall_tone,
         )
         if float(np.max(np.abs(layers.get("mix", np.zeros(1))))) < 1e-8:
             return
@@ -880,7 +1084,13 @@ class SpatialRainEngine:
             if self._last_binaural is None or self._last_binaural.shape[0] != frames:
                 self._last_binaural = np.zeros((frames, 2), dtype=np.float64)
             if bi_add.shape[0] == frames:
-                self._last_binaural = self._last_binaural + bi_add
+                # Continuous wash is only a soft bed under discrete drops on You
+                wash = bi_add * 0.28
+                # Keep wash RMS well below droplet peaks so soft-clip doesn't erase hits
+                w_rms = float(np.sqrt(np.mean(wash * wash)) + 1e-12)
+                if w_rms > 0.012:
+                    wash = wash * (0.012 / w_rms)
+                self._last_binaural = self._last_binaural + wash
 
     def _apply_reverb(self, mix: Dict[int, np.ndarray], frames: int) -> Dict[int, np.ndarray]:
         if not self.use_reverb:
@@ -934,28 +1144,32 @@ class SpatialRainEngine:
         # Continuous outdoor field through portals (procedural ± WAV samples)
         self._mix_outdoor_field(frames, mix)
 
-        # Soft directional wind whoosh — strength from speed, pan from heading
+        # Wind air — layered body/whoosh/gusts (WindAirSynth), not pink static
         wabs = self._wind_speed()
-        if wabs > 0.06:
-            whoosh = self._wind_whoosh_block(frames, wabs)
-            if whoosh is not None and self._last_binaural is not None:
-                if self._last_binaural.shape[0] == frames:
+        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
+        if mix_wind > 0.02 and wabs > 0.03:
+            open_avg = self._open_avg()
+            # Audible under rain without drowning droplets; mix_wind is gain
+            wind_level = (0.055 + 0.070 * wabs) * mix_wind
+            mono_wind = self._wind_air.render(
+                frames, wind=wabs, level=wind_level, open_avg=open_avg
+            )
+            if mono_wind is not None and float(np.max(np.abs(mono_wind))) > 1e-8:
+                if self._last_binaural is not None and self._last_binaural.shape[0] == frames:
                     wx, wz = self._wind_push()
-                    # Listener-relative: +right from east component vs yaw
                     yaw = float(getattr(self.room.listener, "yaw", 0.0))
-                    # rotate push into listener frame
                     c, s = math.cos(yaw), math.sin(yaw)
                     right = wx * c - wz * s
-                    pan = max(-1.0, min(1.0, right))
-                    gL = 0.55 - 0.35 * pan
-                    gR = 0.55 + 0.35 * pan
-                    self._last_binaural[:, 0] += whoosh * gL
-                    self._last_binaural[:, 1] += whoosh * gR
-            for i, spk in enumerate(self.room.speakers):
-                if i not in mix or not getattr(spk, "enabled", True):
-                    continue
-                open_avg = self._open_avg()
-                mix[i] = mix[i] + whoosh * (0.12 * wabs * (0.4 + 0.6 * open_avg))
+                    pan = max(-1.0, min(1.0, right / max(0.08, wabs)))
+                    # Headphones a touch quieter (close to ears)
+                    bi = self._wind_air.to_stereo(mono_wind, pan=pan, level=0.50)
+                    if bi.shape[0] == frames:
+                        self._last_binaural = self._last_binaural + bi
+                spk_g = 0.70 * (0.40 + 0.60 * wabs) * (0.40 + 0.60 * open_avg)
+                for i, spk in enumerate(self.room.speakers):
+                    if i not in mix or not getattr(spk, "enabled", True):
+                        continue
+                    mix[i] = mix[i] + mono_wind * spk_g
 
         # Mild indoor room reverb (size / open windows shape wetness)
         mix = self._apply_reverb(mix, frames)
@@ -963,31 +1177,15 @@ class SpatialRainEngine:
         # Soft bus makeup — sample-wise soft clip (never hard block peak-norm)
         q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
         spk_make = 1.45 + 0.15 * q
-        bi_make = 1.55 + 0.18 * q
+        # Minimal binaural makeup — drops already boosted; wash is capped underlay
+        bi_make = 1.02 + 0.06 * q
         out = {}
         for i, buf in mix.items():
             out[i] = _soft_clip(buf * spk_make, 0.75)
         if self._last_binaural is not None and self._last_binaural.shape[0] == frames:
-            self._last_binaural = _soft_clip(self._last_binaural * bi_make, 0.75)
+            # Higher ceiling so droplet transients aren't squashed into wash
+            self._last_binaural = _soft_clip(self._last_binaural * bi_make, 0.88)
         return out
-
-    def _wind_whoosh_block(self, frames: int, wind: float) -> np.ndarray:
-        """Very soft filtered air noise — wind character, not rain bed."""
-        wabs = abs(float(wind))
-        if wabs < 0.05 or frames <= 0:
-            return np.zeros(max(0, frames), dtype=np.float64)
-        # Reuse continuous bed generator at tiny level, extra dark LP
-        level = 0.018 * wabs  # stays subtle even at full wind
-        raw = self._bed_water.render(frames, intensity=0.6 + 0.4 * wabs, level=level)
-        # Band-limit to airy mid whoosh
-        from app.audio.engine import _hp1, _lp1
-        y = _hp1(raw, 180.0, self.samplerate)
-        y = _lp1(y, 900.0 + 700.0 * wabs, self.samplerate)
-        # Slow amplitude flutter
-        t0 = self._time
-        t = t0 + np.arange(frames, dtype=np.float64) / self.samplerate
-        am = 0.75 + 0.25 * np.sin(2 * math.pi * (0.15 + 0.4 * wabs) * t + wind)
-        return y * am
 
     def _reset_sim(self, seed: int = 11):
         self._voices = deque()
@@ -997,8 +1195,7 @@ class SpatialRainEngine:
         self._next_event = 0.0
         self._evt_id = 0
         self._rng = np.random.RandomState(seed)
-        self._bed_water = ContinuousRainBed(sr=self.samplerate, seed=4242 + seed)
-        self._bed_roof = ContinuousRainBed(sr=self.samplerate, seed=7771 + seed)
+        self._wind_air = WindAirSynth(sr=self.samplerate, seed=4242 + seed)
         self._field = OutdoorFieldBed(sr=self.samplerate, seed=2024 + seed)
         self._field_router = OutdoorFieldRouter(sr=self.samplerate)
         self._reverb_mono = {}

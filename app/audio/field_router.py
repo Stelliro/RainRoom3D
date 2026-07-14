@@ -248,10 +248,12 @@ class OutdoorFieldRouter:
 
                 d_in = max(0.12, _len(_sub(listener, ap)))
                 att_in = distance_attenuation(d_in, ref=0.45, rolloff=1.15)
-                near_b = 1.0 + 1.4 * math.exp(-d_in * 1.8)
-                g = portal_g * att_in * near_b
+                # Almost no near boost — multi-window stack was drowning drops on headphones
+                near_b = 1.0 + 0.25 * math.exp(-d_in * 2.2)
+                g = portal_g * att_in * near_b * 0.28  # You wash << speaker mics
                 if g >= 1e-6:
-                    fc_in = max(1200.0, 9000.0 / (1.0 + 0.35 * d_in))
+                    # Darker indoor path: kills hiss/static that speakers hide in the room
+                    fc_in = max(800.0, 4800.0 / (1.0 + 0.45 * d_in))
                     delay_n = min(self._max_delay, delay_out_n + int(round((d_in / C_SOUND) * sr)))
                     az, el = azimuth_elevation(listener, ap, yaw=yaw)
                     if layer == "canopy":
@@ -348,21 +350,30 @@ class OutdoorFieldRouter:
                 folded[key] = x if layer != "canopy" else x * 0.65
 
         # Stateful LP per layer (continuous) — paths only delay + gain
-        layer_lp = {
-            "near": 4200.0,   # darker near layer (less HF hash)
-            "mid": 2800.0,
-            "far": 1400.0,
+        # Speakers keep air; binaural is much darker (hiss reads as static on cans)
+        layer_lp_spk = {
+            "near": 3600.0,
+            "mid": 2400.0,
+            "far": 1200.0,
+        }
+        layer_lp_bi = {
+            "near": 1500.0,
+            "mid": 1000.0,
+            "far": 650.0,
         }
         for layer, x in folded.items():
             if float(np.max(np.abs(x))) < 1e-9:
                 continue
-            fc0 = layer_lp.get(layer, 2800.0)
             st = self._lp_state.get(layer, 0.0)
-            x_lp, st = _lp_zi(x, fc0, self.sr, st)
+            x_spk, st = _lp_zi(x, layer_lp_spk.get(layer, 2400.0), self.sr, st)
             self._lp_state[layer] = st
+            # Extra darkening for headphones only (don't mutate speaker state twice hard)
+            st_bi = self._lp_state.get(layer + "_bi", 0.0)
+            x_bi, st_bi = _lp_zi(x, layer_lp_bi.get(layer, 1000.0), self.sr, st_bi)
+            self._lp_state[layer + "_bi"] = st_bi
 
             for p in self._speaker_paths.get(layer, []):
-                y = p["dl"].process(x_lp * p["gain"], p["delay"])
+                y = p["dl"].process(x_spk * p["gain"], p["delay"])
                 si = p["si"]
                 if si not in spk_out:
                     spk_out[si] = np.zeros(frames, dtype=np.float64)
@@ -370,10 +381,20 @@ class OutdoorFieldRouter:
 
             if bi is not None:
                 for p in self._listener_paths.get(layer, []):
-                    y = p["dl"].process(x_lp * p["gain"], p["delay"])
+                    y = p["dl"].process(x_bi * p["gain"], p["delay"])
                     bi += _light_binaural(
                         y, p["az"], p["el"], max(0.35, p["dist"]), self.sr
                     )
+
+        # Cap binaural wash peak + RMS so multi-window stack stays underlay
+        # (peak alone left continuous ocean energy that buried droplets)
+        if bi is not None:
+            pk = float(np.max(np.abs(bi)) + 1e-12)
+            if pk > 0.055:
+                bi *= 0.055 / pk
+            rms = float(np.sqrt(np.mean(bi * bi)) + 1e-12)
+            if rms > 0.016:
+                bi *= 0.016 / rms
 
         return spk_out, bi
 
@@ -381,4 +402,7 @@ class OutdoorFieldRouter:
         self._fingerprint = None
         self._speaker_paths = {}
         self._listener_paths = {}
-        self._lp_state = {"near": 0.0, "mid": 0.0, "far": 0.0, "leak": 0.0}
+        self._lp_state = {
+            "near": 0.0, "mid": 0.0, "far": 0.0, "leak": 0.0,
+            "near_bi": 0.0, "mid_bi": 0.0, "far_bi": 0.0,
+        }

@@ -15,21 +15,64 @@ from typing import List, Optional, Tuple
 # Wall names: north = +Z, south = -Z, east = +X, west = -X
 WALLS = ("north", "south", "east", "west")
 
+# Recommended sound-mix levels (0..2×). Used as Room field defaults, UI reset,
+# and JSON load fallbacks when older saves omit mix keys.
+MIX_WASH_RECOMMENDED = 0.05
+MIX_DROPLETS_RECOMMENDED = 2.0
+MIX_REVERB_RECOMMENDED = 1.0
+MIX_WIND_RECOMMENDED = 1.0
+
 
 @dataclass
 class Speaker:
-    """Physical output mapped to a point inside the house."""
+    """Physical output mapped to a point inside the house.
+
+    Dimensions (meters):
+      width  — horizontal span (soundbar = wide → wide pickup range)
+      height — vertical size
+      depth  — thickness into the room
+    Legacy ``size`` is kept as a fallback cube edge when w/h/d unset.
+    """
     name: str
     x: float
     y: float
     z: float
-    # Visual / placement size (cube edge length in meters) — editable in 3D
+    # Legacy isotropic size (fallback / older saves)
     size: float = 0.32
+    # Independent box dims — width drives acoustic “range”
+    width: float = 0.0   # 0 → use size
+    height: float = 0.0  # 0 → use size
+    depth: float = 0.0   # 0 → min(size, 0.22)
     material: Optional[str] = None
     audio_device: Optional[int] = None  # sounddevice device index
     gain_db: float = 0.0
     enabled: bool = True
     notes: str = ""
+
+    def box_dims(self) -> Tuple[float, float, float]:
+        """Return (width, height, depth) in meters for draw + acoustics."""
+        s = max(0.10, float(self.size or 0.32))
+        w = float(self.width) if float(self.width or 0.0) > 1e-6 else s
+        h = float(self.height) if float(self.height or 0.0) > 1e-6 else s
+        d = float(self.depth) if float(self.depth or 0.0) > 1e-6 else min(s, 0.22)
+        return (
+            max(0.10, min(2.5, w)),
+            max(0.08, min(2.0, h)),
+            max(0.06, min(1.2, d)),
+        )
+
+    def materialize_dims(self) -> Tuple[float, float, float]:
+        """Bake resolved w/h/d onto fields so one dim can shrink without others growing."""
+        w, h, d = self.box_dims()
+        self.width, self.height, self.depth = w, h, d
+        self.size = max(w, h, d)
+        return w, h, d
+
+    def acoustic_width(self) -> float:
+        """Horizontal span used for multi-point mic range (soundbar vs mono)."""
+        w, h, d = self.box_dims()
+        # Prefer the larger horizontal footprint dimension
+        return max(w, d)
 
 
 @dataclass
@@ -97,6 +140,11 @@ class Window:
     custom_motion: str = "swing"     # swing|slide|tilt|fixed
     custom_outward: bool = True      # swing/tilt direction (out vs in)
     custom_notes: str = ""           # free text description
+    # Free-form placement: glass can sit off-wall / stick past corners
+    free_place: bool = False
+    free_x: float = 0.0              # room-space glass center when free_place
+    free_y: float = 1.4
+    free_z: float = 0.0
     # Legacy fields kept for older render paths / JSON
     x: float = 0.0
     z: float = 0.0
@@ -222,6 +270,13 @@ class Room:
     master_volume: float = 0.75    # 0..1 user listen level (1 = calibrated full scale)
     name: str = "My House"
 
+    # --- Sound mix (permanent user prefs, 0..2×; saved with the house) ---
+    # Recommended baseline: soft wash under clear droplets; neutral echo/wind.
+    mix_wash: float = MIX_WASH_RECOMMENDED
+    mix_droplets: float = MIX_DROPLETS_RECOMMENDED
+    mix_reverb: float = MIX_REVERB_RECOMMENDED
+    mix_wind: float = MIX_WIND_RECOMMENDED
+
     # --- Wind (rain is blown TOWARD this direction) ---
     # 0° = North (+Z), 90° = East (+X), 180° = South (−Z), 270° = West (−X)
     wind_speed: float = 0.0              # 0..1
@@ -284,22 +339,31 @@ class Room:
         )
 
     def sync_window_coords(self, win: Window) -> None:
-        """Write legacy x/z from wall + offset for GL / older code."""
+        """Write legacy x/z from wall + offset (or free center) for GL / older code."""
         wall = (win.wall or "north").lower()
-        off = max(0.0, min(win.offset, _wall_length(self, wall) - win.width))
-        win.offset = off
+        if getattr(win, "free_place", False):
+            win.x = float(getattr(win, "free_x", win.x))
+            win.z = float(getattr(win, "free_z", win.z))
+            return
+        wl = _wall_length(self, wall)
+        # Stick-out past corners allowed (±45% of width) for freer design
+        lo = -float(win.width) * 0.45
+        hi = wl - float(win.width) * 0.55
+        if hi < lo:
+            hi = lo
+        win.offset = max(lo, min(float(win.offset), hi))
         if wall == "north":
-            win.x = off
+            win.x = win.offset
             win.z = self.depth
         elif wall == "south":
-            win.x = off
+            win.x = win.offset
             win.z = 0.0
         elif wall == "east":
             win.x = self.width
-            win.z = off
+            win.z = win.offset
         else:  # west
             win.x = 0.0
-            win.z = off
+            win.z = win.offset
 
     def sync_all_windows(self) -> None:
         for w in self.windows:
@@ -308,6 +372,12 @@ class Room:
     def window_center(self, win: Window) -> Tuple[float, float, float]:
         """World center of the *effective open gap* (inside face)."""
         self.sync_window_coords(win)
+        if getattr(win, "free_place", False):
+            return (
+                float(getattr(win, "free_x", win.x)),
+                float(getattr(win, "free_y", 1.2)),
+                float(getattr(win, "free_z", win.z)),
+            )
         gy0, gy1 = win.effective_gap_y_range()
         y = 0.5 * (gy0 + gy1)
         # Lateral centre: casement/slider may bias toward the open edge
@@ -315,15 +385,12 @@ class Room:
         style = win.open_style_norm()
         o = win.open_amount()
         if style in ("casement", "tilt_turn", "slider") and o > 0.02:
-            # Opening concentrates near hinge-opposite edge as it opens
             side = (getattr(win, "hinge_side", "left") or "left").lower()
             if style == "slider":
-                # sliding panel reveals gap at one end
                 edge = win.offset + (win.width * (1.0 - 0.5 * o) if side == "left"
                                     else win.width * (0.5 * o))
                 lat = edge
             else:
-                # casement swings — acoustic gap along free edge
                 if side == "left":
                     lat = win.offset + win.width * (0.15 + 0.7 * (1.0 - 0.5 * o))
                 else:

@@ -266,11 +266,14 @@ class OutdoorFieldBed:
         quantity: float = 0.5,
         sharpness: float = 0.35,
         level: float = 0.06,
+        wall_tone: float = 0.45,
     ) -> Dict[str, np.ndarray]:
         """Soft outdoor layers. Quantity only gently fills the underlay.
 
         Does **not** turn into white noise at high quantity — stays dark/wet.
         Sharpness gently opens the top of the bed (still capped low).
+        wall_tone 0..1: subtle house-wall colouring of the brown wash
+          (brick darker, glass/metal slightly more open) — small shift only.
         """
         n = int(n)
         empty = {
@@ -285,6 +288,7 @@ class OutdoorFieldBed:
 
         q = max(0.0, min(1.0, float(quantity)))
         sh = max(0.0, min(1.0, float(sharpness)))
+        wt = max(0.0, min(1.0, float(wall_tone)))
         if q < 0.008 or level <= 0:
             self.t += n / max(1, self.sr)
             return empty
@@ -297,17 +301,20 @@ class OutdoorFieldBed:
         w2 = self.rng.randn(n).astype(np.float64)
         w3 = self.rng.randn(n).astype(np.float64)
 
-        # Brown "pitch" from sharpness: soft = darker/heavier, sharp = thinner/brighter
-        # (still brown — never white). Filter pole a↑ → darker.
-        a_soft = 0.996 - 0.010 * sh          # 0.996 → 0.986
-        a_far = 0.997 - 0.008 * sh
+        # Brown "pitch" from sharpness + subtle wall tone (not a big jump).
+        # a↑ → darker. wall_tone↑ → slightly thinner brown (glass/metal).
+        a_soft = 0.996 - 0.010 * sh - 0.004 * (wt - 0.45)
+        a_soft = max(0.985, min(0.997, a_soft))
+        a_far = 0.997 - 0.008 * sh - 0.003 * (wt - 0.45)
+        a_far = max(0.988, min(0.998, a_far))
         brown, self._b = self._brown(w1, self._b, a_soft)
         brown2, self._b2 = self._brown(w2, self._b2, a_soft - 0.002)
         far_b, self._b3 = self._brown(w3, self._b3, a_far)
 
-        # Band pitch follows sharpness (body stays wet; sheen adds the high pitch)
-        body_fc = 480.0 + 1600.0 * sh         # ~480 soft → ~2080 sharp
-        mid_fc = 900.0 + 2600.0 * sh          # ~900 → ~3500
+        # Band pitch: sharpness primary, wall_tone a gentle nudge (~±15%)
+        wall_k = 0.88 + 0.28 * wt
+        body_fc = (420.0 + 1200.0 * sh) * wall_k       # stay wetter overall
+        mid_fc = (750.0 + 1800.0 * sh) * wall_k
         body, self._lp_body = _lp(0.80 * brown + 0.20 * brown2, body_fc, sr, self._lp_body)
         mid_src, self._lp_mid = _lp(0.55 * brown + 0.45 * brown2, mid_fc, sr, self._lp_mid)
 
@@ -329,15 +336,16 @@ class OutdoorFieldBed:
                 pink_hi[i] = 0.55 * pacc + 0.45 * wv
             self._p = pacc
         # High-pass into the "air" band, then gentle top cut so it doesn't hiss
-        sheen_hp = 1600.0 + 900.0 * sh          # ~1.6–2.5 kHz
-        sheen_lp = 4200.0 + 3200.0 * sh         # ~4.2–7.4 kHz
+        # Wall tone slightly opens air; keep modest so wash isn't plastic
+        sheen_hp = 1400.0 + 700.0 * sh + 150.0 * wt
+        sheen_lp = 3200.0 + 2200.0 * sh + 400.0 * wt
         sheen, self._hp_sheen_y, self._hp_sheen_x = _hp(
             pink_hi, sheen_hp, sr, self._hp_sheen_y, self._hp_sheen_x
         )
         sheen, self._lp_sheen = _lp(sheen, sheen_lp, sr, self._lp_sheen)
         sheen, self._lp_sheen2 = _lp(sheen, sheen_lp * 0.92, sr, self._lp_sheen2)
-        # Sheen tracks density hard — low quantity must not be a hiss blanket
-        sheen_g = (0.012 + 0.16 * dens) * (0.10 + 0.90 * (sh ** 0.85))
+        # Sheen tracks density; wall_tone a small gain nudge only
+        sheen_g = (0.010 + 0.12 * dens) * (0.08 + 0.75 * (sh ** 0.85)) * (0.90 + 0.18 * wt)
 
         # Sparse high sparkles — fewer at low dens so wet notes stay clear
         spark_rate = 1.0 + 40.0 * dens * (0.15 + 0.85 * sh) + 18.0 * sh * dens
@@ -460,5 +468,6 @@ class OutdoorFieldBed:
         quantity: float = 0.5,
         sharpness: float = 0.35,
         level: float = 0.06,
+        wall_tone: float = 0.45,
     ) -> np.ndarray:
-        return self.render_layers(n, quantity, sharpness, level)["mix"]
+        return self.render_layers(n, quantity, sharpness, level, wall_tone=wall_tone)["mix"]
