@@ -13,6 +13,7 @@ import math
 import random
 import time
 
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -72,9 +73,12 @@ class GLRoomView(QOpenGLWidget):
         self._target = [0.0, 1.2, 0.0]
         self.room = None
         self.roof_type = "Flat"
-        self._rain_particles = []
+        # Visual rain is independent of audio droplets. Batched GL lines are
+        # cheap; keep a dense field without 1:1 Python glVertex calls.
+        self._rain = np.zeros((0, 5), dtype=np.float32)  # x y z vy kind
+        self._rain_verts = np.zeros((0, 3), dtype=np.float32)
         self._splashes = []
-        self._max_particles = 900
+        self._max_particles = 2400
         self._selection = PICK_NONE
         self._dragging = False
         self._mode = MODE_MOVE
@@ -83,9 +87,14 @@ class GLRoomView(QOpenGLWidget):
         self._gl_error = ""
         self._inited = False
 
+        self._on_impacts = None
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)
+
+    def set_impact_handler(self, fn):
+        """fn(list of (x, y, z, kind)) in room coordinates, called on landings."""
+        self._on_impacts = fn
 
     # ---------- Public API ----------
     def set_room(self, room):
@@ -627,16 +636,36 @@ class GLRoomView(QOpenGLWidget):
         return w, 0.0
 
     def _draw_rain(self):
-        if not self._rain_particles:
+        n = int(self._rain.shape[0])
+        if n <= 0:
             return
+        streak = 0.16
+        verts = self._rain_verts
+        if verts.shape[0] != n * 2:
+            verts = np.zeros((n * 2, 3), dtype=np.float32)
+            self._rain_verts = verts
+        r = self._rain
+        verts[0::2, 0] = r[:, 0]
+        verts[0::2, 1] = r[:, 1]
+        verts[0::2, 2] = r[:, 2]
+        verts[1::2, 0] = r[:, 0]
+        verts[1::2, 1] = r[:, 1] - streak
+        verts[1::2, 2] = r[:, 2]
         glLineWidth(1.2)
-        glBegin(GL_LINES)
-        glColor4f(0.75, 0.88, 1.0, 0.45)
-        for p in self._rain_particles:
-            x, y, z = p[0], p[1], p[2]
-            glVertex3f(x, y, z)
-            glVertex3f(x, y - 0.14, z)
-        glEnd()
+        glColor4f(0.75, 0.88, 1.0, 0.42)
+        try:
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glVertexPointer(3, GL_FLOAT, 0, verts)
+            glDrawArrays(GL_LINES, 0, n * 2)
+            glDisableClientState(GL_VERTEX_ARRAY)
+        except Exception:
+            # Immediate-mode fallback if the driver rejects client arrays
+            glBegin(GL_LINES)
+            for i in range(n):
+                x, y, z = float(r[i, 0]), float(r[i, 1]), float(r[i, 2])
+                glVertex3f(x, y, z)
+                glVertex3f(x, y - streak, z)
+            glEnd()
 
     def _draw_selection_ring(self):
         if self._selection == PICK_NONE or not self.room:
@@ -666,30 +695,67 @@ class GLRoomView(QOpenGLWidget):
             glVertex3f(x + r * math.cos(a), 0.03, z + r * math.sin(a))
         glEnd()
 
-    # ---------- Rain sim ----------
-    def _spawn_world_rain(self):
-        if not self.room:
-            return []
-        w, h, d = self.room.width, self.room.height, self.room.depth
-        R = max(w, d) * 4.5
-        dens = max(0.08, float(getattr(self.room, "droplet_density", 0.5)))
-        count = int(self._max_particles * 0.65 * dens)
-        drops = []
-        for _ in range(count):
-            drops.append([
-                random.uniform(-R, R),
-                random.uniform(h + 0.5, h + 4.0),
-                random.uniform(-R, R),
-                random.uniform(-3.0, -5.0),
-                1,
-            ])
-        return drops
+    # ---------- Rain sim (visual only — audio droplets are independent) ----------
+    def _visual_target(self) -> int:
+        dens = max(0.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0))
+        if dens <= 0.0005:
+            return 0
+        # Drizzle ~80 streaks, downpour fills the cap — each landing makes a tick.
+        n = int(80 + (self._max_particles - 80) * (dens ** 1.12))
+        return max(24, min(self._max_particles, n))
 
-    def _spawn_window_ingress(self):
+    def _spawn_world_rain(self, count: int) -> np.ndarray:
+        """Rain over the room footprint plus a thin eaves ring (not the whole terrain)."""
+        if not self.room or count <= 0:
+            return np.zeros((0, 5), dtype=np.float32)
+        w, h, d = float(self.room.width), float(self.room.height), float(self.room.depth)
+        half_w, half_d = w * 0.5, d * 0.5
+        n = int(count)
+        out = np.empty((n, 5), dtype=np.float32)
+        u = np.random.random(n)
+        roof_mat = str(getattr(self.room, "roof_material", "") or "").lower()
+        tin_roof = ("tin" in roof_mat) or ("metal" in roof_mat)
+        # Quantity is for the house, not a 40 m field. A little overshoot = gutters / drip line.
+        p_roof = 0.88 if tin_roof else 0.78
+        dens = max(0.0, min(1.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0)))
+        y_span = 3.8 - 1.1 * dens
+        eaves = 0.85
+        for i in range(n):
+            if u[i] < p_roof:
+                x = float(np.random.uniform(-half_w, half_w))
+                z = float(np.random.uniform(-half_d, half_d))
+                y0 = h + float(np.random.uniform(0.35, max(0.8, y_span)))
+                kind = 3.0
+            else:
+                dist = float(np.random.uniform(0.12, eaves))
+                per = 2.0 * ((w + 2.0 * dist) + (d + 2.0 * dist))
+                t = float(np.random.uniform(0.0, per))
+                pw = w + 2.0 * dist
+                pd = d + 2.0 * dist
+                if t < pw:
+                    x, z = t - dist - half_w, half_d + dist
+                else:
+                    t -= pw
+                    if t < pd:
+                        x, z = half_w + dist, t - dist - half_d
+                    else:
+                        t -= pd
+                        if t < pw:
+                            x, z = half_w + dist - t, -half_d - dist
+                        else:
+                            t -= pw
+                            x, z = -half_w - dist, half_d + dist - t
+                y0 = float(np.random.uniform(h * 0.35, h + y_span))
+                kind = 1.0
+            vy = float(np.random.uniform(-(3.2 + 1.6 * dens), -(5.4 + 2.4 * dens)))
+            out[i] = (x, y0, z, vy, kind)
+        return out
+
+    def _spawn_window_ingress(self) -> np.ndarray:
         if not self.room:
-            return []
-        w, d = self.room.width, self.room.depth
-        drops = []
+            return np.zeros((0, 5), dtype=np.float32)
+        w, d = float(self.room.width), float(self.room.depth)
+        rows = []
         for win in self.room.windows:
             if float(getattr(win, "open", 0.0)) <= 0.05:
                 continue
@@ -703,59 +769,94 @@ class GLRoomView(QOpenGLWidget):
                     cy = float(getattr(win, "sill", 0.9)) + 0.4
             except Exception:
                 continue
-            n = max(2, int(10 * float(getattr(win, "open", 0.5))))
+            n = max(1, int(3 * float(getattr(win, "open", 0.5))))
             for _ in range(n):
-                drops.append([
+                rows.append((
                     cx + random.uniform(-0.25, 0.25),
                     random.uniform(max(0.2, cy - 0.35), cy + 0.35),
                     cz + random.uniform(-0.25, 0.25),
                     random.uniform(-2.5, -3.5),
-                    2,
-                ])
-        return drops
+                    2.0,
+                ))
+        if not rows:
+            return np.zeros((0, 5), dtype=np.float32)
+        return np.asarray(rows, dtype=np.float32)
 
     def _init_particles(self):
-        self._rain_particles = []
+        self._rain = np.zeros((0, 5), dtype=np.float32)
+        self._rain_verts = np.zeros((0, 3), dtype=np.float32)
         if not self.room:
             return
-        self._rain_particles = self._spawn_world_rain()
-        self._rain_particles.extend(self._spawn_window_ingress())
+        world = self._spawn_world_rain(self._visual_target())
+        win = self._spawn_window_ingress()
+        if win.shape[0]:
+            self._rain = np.vstack([world, win])
+        else:
+            self._rain = world
 
     def _tick(self):
         if not self.room or not self.isVisible():
             return
+        dens = max(0.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0))
+        if dens <= 0.0005:
+            if self._rain.shape[0]:
+                self._rain = np.zeros((0, 5), dtype=np.float32)
+                self.update()
+            return
         wx, wz = self._wind_push()
-        # Scale push for visual rain drift
         wx *= 2.2
         wz *= 2.2
+        dt = 0.033
         h = float(self.room.height)
-        dens = max(0.08, float(getattr(self.room, "droplet_density", 0.5)))
-        R = max(self.room.width, self.room.depth) * 4.5
-        new = []
-        for p in self._rain_particles:
-            p[1] += p[3] * 0.033
-            p[0] += wx * 0.033
-            p[2] += wz * 0.033
-            if p[1] <= 0.0:
-                self._splashes.append((p[0], p[2], time.time()))
-                if p[4] == 1:
-                    p[0] = random.uniform(-R, R)
-                    p[2] = random.uniform(-R, R)
-                    p[1] = h + random.uniform(0.5, 4.0)
-                    p[3] = random.uniform(-3.0, -5.0)
-                    new.append(p)
-            else:
-                new.append(p)
-        self._rain_particles = new
-        target = int(self._max_particles * 0.65 * dens)
-        world = [d for d in self._rain_particles if d[4] == 1]
-        if len(world) < target:
-            self._rain_particles.extend(self._spawn_world_rain()[: target - len(world)])
-        if random.random() < 0.25:
-            self._rain_particles.extend(self._spawn_window_ingress())
-        # Cap
-        if len(self._rain_particles) > self._max_particles:
-            self._rain_particles = self._rain_particles[: self._max_particles]
+        if self._rain.shape[0] == 0:
+            self._init_particles()
+        r = self._rain
+        if r.shape[0] == 0:
+            self.update()
+            return
+        r[:, 0] += wx * dt
+        r[:, 1] += r[:, 3] * dt
+        r[:, 2] += wz * dt
+        ground = np.where(r[:, 4] == 3.0, h + 0.02, 0.0)
+        dead = r[:, 1] <= ground
+        n_dead = int(np.count_nonzero(dead))
+        if n_dead:
+            hits = r[dead]
+            if self._on_impacts is not None:
+                hw = float(self.room.width) * 0.5
+                hd = float(self.room.depth) * 0.5
+                payload = []
+                for i in range(hits.shape[0]):
+                    payload.append((
+                        float(hits[i, 0]) + hw,
+                        float(hits[i, 1]),
+                        float(hits[i, 2]) + hd,
+                        int(hits[i, 4]),
+                    ))
+                try:
+                    self._on_impacts(payload)
+                except Exception:
+                    log.exception("rain impact handler")
+            if len(self._splashes) < 40:
+                for i in range(min(4, hits.shape[0])):
+                    self._splashes.append((float(hits[i, 0]), float(hits[i, 2]), time.time()))
+                if len(self._splashes) > 40:
+                    self._splashes = self._splashes[-40:]
+            r[dead] = self._spawn_world_rain(n_dead)
+        target = self._visual_target()
+        n = int(r.shape[0])
+        if n < target:
+            extra = self._spawn_world_rain(target - n)
+            r = np.vstack([r, extra]) if extra.shape[0] else r
+        elif n > self._max_particles:
+            r = r[: self._max_particles]
+        if random.random() < 0.06:
+            acc = self._spawn_window_ingress()
+            if acc.shape[0]:
+                r = np.vstack([r, acc])
+                if r.shape[0] > self._max_particles:
+                    r = r[: self._max_particles]
+        self._rain = r
         self.update()
 
     # ---------- Interaction ----------

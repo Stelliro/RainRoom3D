@@ -19,9 +19,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+try:
+    from scipy import signal as sp_signal
+    _HAS_SCIPY = True
+except Exception:  # pragma: no cover
+    sp_signal = None
+    _HAS_SCIPY = False
 
 C_SOUND = 343.0
 Vec3 = Tuple[float, float, float]
@@ -48,16 +55,14 @@ def one_pole_lp(x: np.ndarray, fc: float, sr: float) -> np.ndarray:
     rc = 1.0 / (2.0 * math.pi * fc)
     dt = 1.0 / sr
     a = dt / (rc + dt)
-    try:
-        from scipy import signal as sp_signal
+    if _HAS_SCIPY:
         return sp_signal.lfilter([a], [1.0, -(1.0 - a)], x)
-    except Exception:
-        y = np.empty_like(x)
-        acc = 0.0
-        for i, v in enumerate(x):
-            acc = acc + a * (float(v) - acc)
-            y[i] = acc
-        return y
+    y = np.empty_like(x)
+    acc = 0.0
+    for i, v in enumerate(x):
+        acc = acc + a * (float(v) - acc)
+        y[i] = acc
+    return y
 
 
 def delay_samples(sig: np.ndarray, delay_n: int) -> np.ndarray:
@@ -73,10 +78,12 @@ def binaural(
     elevation_rad: float = 0.0,
     distance: float = 1.5,
     sr: int = 48000,
+    quality: str = "full",
 ) -> np.ndarray:
     """Mono → stereo via parametric HRTF (ITD/ILD, pinna notch, rear shadow).
 
     az 0=front, negative=left, positive=right (listener-relative).
+    quality='fast' keeps ILD+ITD only (used under high droplet load).
     """
     from app.audio.hrtf import apply_hrtf
     return apply_hrtf(
@@ -85,6 +92,7 @@ def binaural(
         elevation_rad=elevation_rad,
         distance=distance,
         sr=sr,
+        quality=quality,
     )
 
 
@@ -323,11 +331,17 @@ def couple_outdoor_to_windows(
     mono: np.ndarray,
     src: Vec3,
     sr: int,
+    *,
+    fast: bool = False,
 ) -> List[WindowPortalHit]:
     """Route an outdoor drop into every window portal that can hear it.
 
     Geometry (sill, height, width) and open_style shape the gap, tone,
     and which outdoor heights couple best.
+
+    ``fast`` skips the extra crack-diffraction LP (same portals, cheaper).
+    Sources on the far side of a wall still leak around the corner so a
+    windowless facade is not silent indoors.
     """
     mono = np.asarray(mono, dtype=np.float64).reshape(-1)
     hits: List[WindowPortalHit] = []
@@ -345,10 +359,16 @@ def couple_outdoor_to_windows(
 
         to_src = _sub(src, ap)
         out_align = _dot(_norm(to_src), nrm)
-        if out_align < -0.05:
-            continue
-
         d_out = max(0.2, _len(_sub(src, ext)))
+        wrapped = False
+        wrap_g = 1.0
+        if out_align < -0.05:
+            # Around-the-corner leakage — rain on a windowless side still
+            # reaches indoor mics through adjacent openings, just quieter.
+            wrap_g = 0.11 * math.exp(-0.11 * d_out)
+            if wrap_g < 1.2e-4:
+                continue
+            wrapped = True
         open_amt = max(0.0, min(1.0, float(getattr(w, "open", 0.7))))
         style = "casement"
         if hasattr(w, "resolved_style_for_draw"):
@@ -413,9 +433,12 @@ def couple_outdoor_to_windows(
             lat_g = math.exp(-(lat - half_w) * edge_tight)
 
         # Axis / baffle: hinged sash directs outdoor sound
-        axis = max(0.06, out_align) ** (0.85 / max(0.5, prof["baffle"]))
-
-        att_out = distance_attenuation(d_out, ref=1.0, rolloff=1.1)
+        if wrapped:
+            axis = wrap_g
+            att_out = distance_attenuation(d_out, ref=1.4, rolloff=1.25)
+        else:
+            axis = max(0.06, out_align) ** (0.85 / max(0.5, prof["baffle"]))
+            att_out = distance_attenuation(d_out, ref=1.0, rolloff=1.1)
         depth_g = 1.0 / (1.0 + 0.08 * max(0.0, d_out - 1.0))
 
         gain = 2.6 * prof["gain"] * att_out * axis * lat_g * vert_g * depth_g
@@ -424,13 +447,15 @@ def couple_outdoor_to_windows(
 
         fc_air = air_absorption_cutoff(d_out, base_hz=10000.0)
         fc = min(fc_air, prof["lp_fc"])
+        if wrapped:
+            fc = min(fc, 1700.0)
         # Bright styles keep a little more HF through the gap
-        if prof["bright"] > 0:
+        if (not wrapped) and prof["bright"] > 0:
             fc = min(12000.0, fc * (1.0 + 0.35 * prof["bright"]))
 
         sig = one_pole_lp(mono, fc, sr) * gain
         # Micro edge diffraction: slight HF tick for crack openings
-        if prof["crack_k"] > 0.05 and open_amt > 0.02:
+        if (not fast) and (not wrapped) and prof["crack_k"] > 0.05 and open_amt > 0.02:
             crack = mono - one_pole_lp(mono, 1800.0, sr)
             sig = sig + crack * (0.12 * prof["crack_k"] * gain)
 
@@ -518,10 +543,159 @@ def roof_to_receiver(
     rz = max(0.0, min(float(room.depth), sz))
     roof = (rx, h, rz)
     d = max(0.2, _len(_sub(recv, roof)))
-    g = 0.35 * distance_attenuation(d, ref=1.0, rolloff=1.0) * float(gain_scale)
-    sig = one_pole_lp(np.asarray(mono, dtype=np.float64), 1200.0, sr) * g
+    # Stronger structure path so roof rain is clearly present indoors
+    g = 0.58 * distance_attenuation(d, ref=0.9, rolloff=0.95) * float(gain_scale)
+    roof_name = str(getattr(room, "roof_material", "") or "").lower()
+    fc = 5600.0 if ("tin" in roof_name or "metal" in roof_name) else 1450.0
+    sig = one_pole_lp(np.asarray(mono, dtype=np.float64), fc, sr) * g
     delay_n = int(round((d / C_SOUND) * sr))
     return delay_samples(sig, min(delay_n, int(0.08 * sr)))
+
+
+def _roof_body(
+    room,
+    mono: np.ndarray,
+    src: Vec3,
+    sr: int,
+) -> Optional[Tuple[np.ndarray, Vec3]]:
+    """Filter a roof hit once; None if the source is not on the roof plane."""
+    sx, sy, sz = src
+    h = float(getattr(room, "height", 2.6))
+    if sy < h - 0.2:
+        return None
+    rx = max(0.0, min(float(room.width), sx))
+    rz = max(0.0, min(float(room.depth), sz))
+    roof_name = str(getattr(room, "roof_material", "") or "").lower()
+    fc = 5600.0 if ("tin" in roof_name or "metal" in roof_name) else 1450.0
+    body = one_pole_lp(np.asarray(mono, dtype=np.float64).reshape(-1), fc, sr)
+    return body, (rx, h, rz)
+
+
+def _roof_to_recv(
+    body: np.ndarray,
+    roof_pos: Vec3,
+    recv: Vec3,
+    sr: int,
+    gain_scale: float,
+) -> np.ndarray:
+    d = max(0.2, _len(_sub(recv, roof_pos)))
+    g = 0.58 * distance_attenuation(d, ref=0.9, rolloff=0.95) * float(gain_scale)
+    delay_n = int(round((d / C_SOUND) * sr))
+    return delay_samples(body * g, min(delay_n, int(0.08 * sr)))
+
+
+def radiate_portals_to_receiver_mono(
+    portals: Sequence[WindowPortalHit],
+    recv: Vec3,
+    sr: int,
+    gain_scale: float = 1.0,
+    *,
+    indoor_lp: bool = True,
+) -> np.ndarray:
+    """Indoor radiation of already-coupled portal signals to one mic.
+
+    When ``indoor_lp`` is False, skip the second air filter (portal already
+    absorbed the outdoor leg) — used under high droplet load.
+    """
+    acc = None
+    for p in portals:
+        ap = p.aperture
+        d_in = max(0.12, _len(_sub(recv, ap)))
+        att_in = distance_attenuation(d_in, ref=0.45, rolloff=1.15)
+        near = 1.0 + 1.4 * math.exp(-d_in * 1.8)
+        g = float(att_in * near * gain_scale)
+        if g < 1e-6:
+            continue
+        sig = p.signal * g
+        if indoor_lp:
+            fc = max(1200.0, 9000.0 / (1.0 + 0.35 * d_in))
+            sig = one_pole_lp(sig, fc, sr)
+        delay_s = p.delay_s + d_in / C_SOUND
+        delay_n = max(0, min(int(round(delay_s * sr)), int(0.15 * sr)))
+        sig = delay_samples(sig, delay_n)
+        acc = sig if acc is None else _sum_mono(acc, sig)
+    if acc is None:
+        return np.zeros(4, dtype=np.float64)
+    return acc
+
+
+def render_drop_to_receivers(
+    room,
+    mono: np.ndarray,
+    src: Vec3,
+    receivers: Sequence[Tuple[int, Vec3, float]],
+    sr: int,
+    listener: Optional[Tuple[Vec3, float]] = None,
+    *,
+    fast: bool = False,
+    binaural_quality: str = "full",
+) -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray], List[WindowPortalHit]]:
+    """Couple an outdoor drop **once**, then radiate to every indoor mic.
+
+    Returns (speaker_bufs, optional binaural, portal hits). Portal hits are
+    tagged by wall so the engine can feed a surround wall-bus.
+    """
+    portals = couple_outdoor_to_windows(room, mono, src, sr, fast=fast)
+    roof = _roof_body(room, mono, src, sr)
+    indoor_lp = not bool(fast)
+    out: Dict[int, np.ndarray] = {}
+    for idx, recv, gscale in receivers:
+        acc = radiate_portals_to_receiver_mono(
+            portals, recv, sr, gscale, indoor_lp=indoor_lp
+        )
+        if roof is not None:
+            body, rpos = roof
+            acc = _sum_mono(acc, _roof_to_recv(body, rpos, recv, sr, gscale * 0.8))
+        out[int(idx)] = acc
+
+    stereo = None
+    if listener is not None:
+        lpos, yaw = listener
+        for p in portals:
+            hit = indoor_arrival_from_portal(
+                p, lpos, sr, gain_scale=1.0
+            ) if not fast else None
+            if fast:
+                # Cheap indoor: delay+gain, then fast HRTF
+                ap = p.aperture
+                d_in = max(0.12, _len(_sub(lpos, ap)))
+                att_in = distance_attenuation(d_in, ref=0.45, rolloff=1.15)
+                near = 1.0 + 0.25 * math.exp(-d_in * 2.2)
+                g = float(att_in * near)
+                if g < 1e-6:
+                    continue
+                delay_s = p.delay_s + d_in / C_SOUND
+                delay_n = max(0, min(int(round(delay_s * sr)), int(0.15 * sr)))
+                sig = delay_samples(p.signal * g, delay_n)
+                az, el = azimuth_elevation(lpos, ap, yaw=yaw)
+                bi = binaural(
+                    sig, az, el, distance=max(0.35, d_in), sr=sr, quality=binaural_quality
+                )
+            else:
+                if hit is None:
+                    continue
+                arr, sig = hit
+                az, el = azimuth_elevation(lpos, arr.aim, yaw=yaw)
+                bi = binaural(
+                    sig,
+                    az,
+                    el,
+                    distance=max(0.35, arr.indoor_m),
+                    sr=sr,
+                    quality=binaural_quality,
+                )
+            stereo = bi if stereo is None else _sum_stereo(stereo, bi)
+        if roof is not None:
+            body, rpos = roof
+            rs = _roof_to_recv(body, rpos, lpos, sr, 0.7)
+            aim = (lpos[0], float(getattr(room, "height", 2.6)), lpos[2])
+            az, el = azimuth_elevation(lpos, aim, yaw=yaw)
+            bi = binaural(rs, az, el, distance=1.2, sr=sr, quality=binaural_quality)
+            stereo = bi if stereo is None else _sum_stereo(stereo, bi)
+        if stereo is None:
+            stereo = np.zeros((4, 2), dtype=np.float64)
+
+    return out, stereo, portals
 
 
 def render_drop_to_receiver_mono(
@@ -533,21 +707,10 @@ def render_drop_to_receiver_mono(
     gain_scale: float = 1.0,
 ) -> np.ndarray:
     """Full outdoor→windows→receiver mono field for one drop."""
-    portals = couple_outdoor_to_windows(room, mono, src, sr)
-    acc = None
-    for p in portals:
-        hit = indoor_arrival_from_portal(p, recv, sr, gain_scale=gain_scale)
-        if hit is None:
-            continue
-        _arr, sig = hit
-        acc = sig if acc is None else _sum_mono(acc, sig)
-    # Optional roof for roof-layer hits
-    roof = roof_to_receiver(room, mono, src, recv, sr, gain_scale=gain_scale * 0.8)
-    if roof is not None:
-        acc = roof if acc is None else _sum_mono(acc, roof)
-    if acc is None:
-        return np.zeros(4, dtype=np.float64)
-    return acc
+    outs, _, _ = render_drop_to_receivers(
+        room, mono, src, [(0, recv, gain_scale)], sr, fast=False
+    )
+    return outs.get(0, np.zeros(4, dtype=np.float64))
 
 
 def render_outdoor_field_block(

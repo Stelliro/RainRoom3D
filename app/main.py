@@ -36,6 +36,11 @@ from app.models.room import (
     MIX_REVERB_RECOMMENDED,
     MIX_WASH_RECOMMENDED,
     MIX_WIND_RECOMMENDED,
+    TONE_PITCH_RECOMMENDED,
+    TONE_RING_RECOMMENDED,
+    TONE_SOFT_RECOMMENDED,
+    TONE_WET_RECOMMENDED,
+    TONE_WEIGHT_RECOMMENDED,
     default_house,
     place_speakers_evenly,
 )
@@ -199,7 +204,7 @@ class Main(QtWidgets.QMainWindow):
         side_lay.addWidget(_section("Workflow"))
         self.nav = QtWidgets.QListWidget()
         self.nav.setObjectName("NavList")
-        self.nav.setFixedHeight(188)
+        self.nav.setFixedHeight(230)
         self.nav.setSpacing(2)
         self.nav.setFocusPolicy(QtCore.Qt.NoFocus)
         for label in (
@@ -207,6 +212,7 @@ class Main(QtWidgets.QMainWindow):
             "2  Speakers",
             "3  Simulate rain",
             "4  Sound mix",
+            "5  Drop sound",
         ):
             self.nav.addItem(label)
         self.nav.setCurrentRow(0)
@@ -300,6 +306,7 @@ class Main(QtWidgets.QMainWindow):
             try:
                 self.gl = GLRoomView()
                 self.gl.set_room(self.room)
+                self.gl.set_impact_handler(self.engine.submit_visual_impacts)
                 self.gl.glStatus.connect(self._on_gl_status)
             except Exception as e:
                 log.exception("GL init failed: %s", e)
@@ -356,6 +363,7 @@ class Main(QtWidgets.QMainWindow):
         self.inspector.addWidget(self._build_speakers_panel())
         self.inspector.addWidget(self._build_sim_panel())
         self.inspector.addWidget(self._build_mix_panel())
+        self.inspector.addWidget(self._build_tone_panel())
 
         self._set_tool(TOOL_SELECT)
 
@@ -632,6 +640,12 @@ class Main(QtWidgets.QMainWindow):
         brow.setSpacing(6)
         self.btn_test_spk = QtWidgets.QPushButton("Test this output")
         self.btn_test_spk.setObjectName("Primary")
+        self.btn_test_spk.setToolTip(
+            "Plays a chirp from this speaker’s place in the room. "
+            "If several room speakers share one OS device, the chirp pans "
+            "left/right (or onto surround seats) by how far this one sits "
+            "from the others."
+        )
         self.btn_add_spk_panel = QtWidgets.QPushButton("Add speaker")
         self.btn_del_spk = QtWidgets.QPushButton("Remove")
         self.btn_del_spk.setObjectName("Danger")
@@ -662,10 +676,15 @@ class Main(QtWidgets.QMainWindow):
             hl.setContentsMargins(0, 0, 0, 0)
             hl.setSpacing(8)
             slider.setMinimumHeight(28)
-            label.setMinimumWidth(100)
+            slider.setMinimumWidth(120)
+            label.setMinimumWidth(88)
+            label.setMaximumWidth(150)
+            label.setWordWrap(False)
             label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+            slider.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             hl.addWidget(slider, 1)
-            hl.addWidget(label)
+            hl.addWidget(label, 0)
             return row
 
         lay.addWidget(_section("Weather"))
@@ -680,6 +699,7 @@ class Main(QtWidgets.QMainWindow):
         dens0 = float(self.room.droplet_density)
         self.lbl_rain = QtWidgets.QLabel(self._sharpness_label(self.room.rain_intensity))
         self.lbl_density = QtWidgets.QLabel(self._quantity_label(dens0))
+        self.sld_density.setToolTip(self._quantity_label(dens0))
         form.addRow("Sharpness", _slider_row(self.sld_rain, self.lbl_rain))
         form.addRow("Quantity", _slider_row(self.sld_density, self.lbl_density))
 
@@ -804,6 +824,12 @@ class Main(QtWidgets.QMainWindow):
         self.btn_play_hp.setToolTip("Binaural at “You” only.")
         self.btn_play_multi = QtWidgets.QPushButton("▶  Play mapped speakers only")
         self.btn_play_multi.setMinimumHeight(36)
+        self.btn_play_multi.setToolTip(
+            "Each mapped speaker is a mic in the 3D room. "
+            "A 5.1/7.1 device gets a surround wrap of the outdoor rain; "
+            "stereo pans speakers left/right. Place speakers around the room "
+            "for the evenest image."
+        )
         self.btn_play_all = QtWidgets.QPushButton("▶  Play You + mapped speakers")
         self.btn_play_all.setObjectName("Success")
         self.btn_play_all.setMinimumHeight(36)
@@ -955,6 +981,144 @@ class Main(QtWidgets.QMainWindow):
         lay.addStretch(1)
         return _scroll_panel(inner)
 
+    def _build_tone_panel(self) -> QtWidgets.QWidget:
+        """Ear-lab: change how each drop *sounds* with plain-language sliders."""
+        inner = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(inner)
+        lay.setContentsMargins(4, 4, 12, 16)
+        lay.setSpacing(10)
+
+        tip = QtWidgets.QLabel(
+            "This is for your ears, not for code.\n"
+            "1) Start rain below  2) Move a slider  3) Listen to the hits.\n"
+            "Nothing here is music theory — only deeper / higher / wetter / softer."
+        )
+        tip.setObjectName("Subtitle")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        lay.addWidget(_section("Play while you listen"))
+        play_row = QtWidgets.QHBoxLayout()
+        self.btn_tone_play_you = QtWidgets.QPushButton("Play as You")
+        self.btn_tone_play_you.setObjectName("Primary")
+        self.btn_tone_play_you.setToolTip("Binaural rain on headphones / default output")
+        self.btn_tone_play_spk = QtWidgets.QPushButton("Play speakers")
+        self.btn_tone_play_spk.setToolTip("Mapped multi-device speakers")
+        self.btn_tone_stop = QtWidgets.QPushButton("Stop")
+        play_row.addWidget(self.btn_tone_play_you)
+        play_row.addWidget(self.btn_tone_play_spk)
+        play_row.addWidget(self.btn_tone_stop)
+        lay.addLayout(play_row)
+
+        lay.addWidget(_section("What each drop sounds like"))
+
+        def _tone_row(
+            key: str,
+            title: str,
+            left: str,
+            right: str,
+            hint: str,
+            default: float,
+            getter,
+        ) -> None:
+            box = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QVBoxLayout(box)
+            form.setContentsMargins(10, 14, 10, 10)
+            form.setSpacing(6)
+            h = QtWidgets.QLabel(hint)
+            h.setObjectName("Subtitle")
+            h.setWordWrap(True)
+            form.addWidget(h)
+            ends = QtWidgets.QHBoxLayout()
+            l_left = QtWidgets.QLabel(left)
+            l_left.setObjectName("Subtitle")
+            l_right = QtWidgets.QLabel(right)
+            l_right.setObjectName("Subtitle")
+            l_right.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            ends.addWidget(l_left)
+            ends.addWidget(l_right)
+            form.addLayout(ends)
+            row = QtWidgets.QHBoxLayout()
+            sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            sld.setRange(0, 100)
+            sld.setValue(int(round(float(getter()) * 100)))
+            sld.setMinimumHeight(28)
+            sld.setToolTip(f"{left}  ←  →  {right}")
+            val = QtWidgets.QLabel(f"{getter():.0%}")
+            val.setMinimumWidth(40)
+            val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            row.addWidget(sld, 1)
+            row.addWidget(val)
+            form.addLayout(row)
+            lay.addWidget(box)
+            setattr(self, f"sld_tone_{key}", sld)
+            setattr(self, f"lbl_tone_{key}", val)
+
+        _tone_row(
+            "pitch",
+            "Pitch",
+            "Deep / low",
+            "High / bright",
+            "Where the hit sits — bass thud vs thinner, higher drip.",
+            TONE_PITCH_RECOMMENDED,
+            lambda: float(getattr(self.room, "tone_pitch", TONE_PITCH_RECOMMENDED)),
+        )
+        _tone_row(
+            "ring",
+            "Note ring",
+            "Soft thump",
+            "More plink",
+            "How much of a little “note” you hear vs pure water body.",
+            TONE_RING_RECOMMENDED,
+            lambda: float(getattr(self.room, "tone_ring", TONE_RING_RECOMMENDED)),
+        )
+        _tone_row(
+            "wet",
+            "Wetness",
+            "Drier tick",
+            "Wet splash",
+            "Dry drip vs juicy splat.",
+            TONE_WET_RECOMMENDED,
+            lambda: float(getattr(self.room, "tone_wet", TONE_WET_RECOMMENDED)),
+        )
+        _tone_row(
+            "soft",
+            "Softness",
+            "Snappy",
+            "Rounded",
+            "Sharp attack vs soft pillow landing.",
+            TONE_SOFT_RECOMMENDED,
+            lambda: float(getattr(self.room, "tone_soft", TONE_SOFT_RECOMMENDED)),
+        )
+        _tone_row(
+            "weight",
+            "Drop weight",
+            "Tiny spray",
+            "Fat drops",
+            "Small light hits vs heavier, bigger drops (also feels lower).",
+            TONE_WEIGHT_RECOMMENDED,
+            lambda: float(getattr(self.room, "tone_weight", TONE_WEIGHT_RECOMMENDED)),
+        )
+
+        lay.addWidget(_section("Save & reset"))
+        self.btn_tone_reset = QtWidgets.QPushButton("Reset drop sound")
+        self.btn_tone_reset.setToolTip("Restore recommended drop tone (does not change mix levels)")
+        self.btn_tone_save = QtWidgets.QPushButton("Save house…")
+        self.btn_tone_save.setToolTip("Save the house JSON — drop tone is stored with the layout")
+        lay.addWidget(self.btn_tone_reset)
+        lay.addWidget(self.btn_tone_save)
+
+        help2 = QtWidgets.QLabel(
+            "Tip: raise Droplets on Sound mix if hits are too quiet, "
+            "then use Pitch + Note ring here to shape them. "
+            "Changes apply live to new drops while rain is playing."
+        )
+        help2.setObjectName("Subtitle")
+        help2.setWordWrap(True)
+        lay.addWidget(help2)
+        lay.addStretch(1)
+        return _scroll_panel(inner)
+
     # ==================================================================
     # Wiring
     # ==================================================================
@@ -1072,24 +1236,48 @@ class Main(QtWidgets.QMainWindow):
         self.btn_mix_reset.clicked.connect(self._reset_mix_defaults)
         self.btn_mix_save.clicked.connect(self._save_house)
 
+        # Drop sound (ear lab)
+        self.sld_tone_pitch.valueChanged.connect(
+            lambda v: self._on_tone_fader("tone_pitch", v, self.lbl_tone_pitch)
+        )
+        self.sld_tone_ring.valueChanged.connect(
+            lambda v: self._on_tone_fader("tone_ring", v, self.lbl_tone_ring)
+        )
+        self.sld_tone_wet.valueChanged.connect(
+            lambda v: self._on_tone_fader("tone_wet", v, self.lbl_tone_wet)
+        )
+        self.sld_tone_soft.valueChanged.connect(
+            lambda v: self._on_tone_fader("tone_soft", v, self.lbl_tone_soft)
+        )
+        self.sld_tone_weight.valueChanged.connect(
+            lambda v: self._on_tone_fader("tone_weight", v, self.lbl_tone_weight)
+        )
+        self.btn_tone_reset.clicked.connect(self._reset_tone_defaults)
+        self.btn_tone_save.clicked.connect(self._save_house)
+        self.btn_tone_play_you.clicked.connect(self._play_headphones)
+        self.btn_tone_play_spk.clicked.connect(self._play_multi)
+        self.btn_tone_stop.clicked.connect(self._stop_audio)
+
     # ==================================================================
     # Step / view
     # ==================================================================
     def _on_step(self, row: int):
-        self.inspector.setCurrentIndex(max(0, min(3, row)))
+        self.inspector.setCurrentIndex(max(0, min(4, row)))
         titles = (
             "Design your house on the terrain",
             "Connect & place speakers",
             "Simulate outdoor rain through your layout",
             "Sound mix — balance wash, droplets, echo, wind",
+            "Drop sound — shape pitch, ring, wetness by ear",
         )
         subs = (
             "Windows · materials · selection inspector",
             "OS devices · map outputs · test tones",
             "Quantity · sharpness · wind · play modes",
             "Saved with the house · reset to recommended anytime",
+            "Play rain, move sliders, listen — no theory needed",
         )
-        i = max(0, min(3, row))
+        i = max(0, min(4, row))
         self.lbl_step.setText(titles[i])
         if hasattr(self, "lbl_step_sub"):
             self.lbl_step_sub.setText(subs[i])
@@ -1104,6 +1292,9 @@ class Main(QtWidgets.QMainWindow):
         elif row == 3:
             self._set_tool(TOOL_SELECT)
             self._sync_mix_sliders()
+        elif row == 4:
+            self._set_tool(TOOL_SELECT)
+            self._sync_tone_sliders()
         else:
             self._set_tool(TOOL_SELECT)
 
@@ -1798,8 +1989,11 @@ class Main(QtWidgets.QMainWindow):
             return
         try:
             idx = self.room.speakers.index(s)
-            self.engine.play_speaker_test(s, index_hint=idx)
-            self.statusBar().showMessage(f"Test tone → {s.name} (device {s.audio_device})")
+            where = self.engine.play_speaker_test(s, index_hint=idx)
+            tag = f"{where}, " if where else ""
+            self.statusBar().showMessage(
+                f"Test tone → {s.name} ({tag}device {s.audio_device})"
+            )
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Test failed", str(e))
 
@@ -1926,8 +2120,10 @@ class Main(QtWidgets.QMainWindow):
     @staticmethod
     def _quantity_label(q: float, wind: float = 0.0) -> str:
         q = max(0.0, min(1.0, float(q)))
+        if q <= 0.0005:
+            return "0%  ·  off"
         if q < 0.12:
-            tag = "sparse drizzle"
+            tag = "drizzle"
         elif q < 0.35:
             tag = "light rain"
         elif q < 0.60:
@@ -1936,9 +2132,8 @@ class Main(QtWidgets.QMainWindow):
             tag = "heavy rain"
         else:
             tag = "downpour"
-        # Approximate droplet rate for the label (matches SpatialRainEngine._ips core)
-        approx_ips = 1.5 + 6.0 * q + 155.0 * (q ** 0.90)
-        return f"{int(q * 100)}%  ·  {tag}  ·  ~{approx_ips:.0f}/s"
+        # Keep this short — a long label collapses the slider in the inspector.
+        return f"{int(q * 100)}%  ·  {tag}"
 
     @staticmethod
     def _volume_label(v: float) -> str:
@@ -1958,7 +2153,9 @@ class Main(QtWidgets.QMainWindow):
     def _on_density(self, v: int):
         # droplet_density = quantity (continuous field mass + discrete accents)
         self.room.droplet_density = v / 100.0
-        self.lbl_density.setText(self._quantity_label(self.room.droplet_density))
+        q = self.room.droplet_density
+        self.lbl_density.setText(self._quantity_label(q))
+        self.sld_density.setToolTip(self._quantity_label(q))
 
     def _on_mix_master(self, v: int):
         """Master 0..100 → 0..1; keep Simulate volume slider in sync."""
@@ -2011,6 +2208,13 @@ class Main(QtWidgets.QMainWindow):
             "wind": round(float(getattr(self.room, "mix_wind", MIX_WIND_RECOMMENDED)), 3),
             "quantity": round(float(getattr(self.room, "droplet_density", 0.55)), 3),
             "sharpness": round(float(getattr(self.room, "rain_intensity", 0.35)), 3),
+            "tone_pitch": round(float(getattr(self.room, "tone_pitch", TONE_PITCH_RECOMMENDED)), 3),
+            "tone_ring": round(float(getattr(self.room, "tone_ring", TONE_RING_RECOMMENDED)), 3),
+            "tone_wet": round(float(getattr(self.room, "tone_wet", TONE_WET_RECOMMENDED)), 3),
+            "tone_soft": round(float(getattr(self.room, "tone_soft", TONE_SOFT_RECOMMENDED)), 3),
+            "tone_weight": round(
+                float(getattr(self.room, "tone_weight", TONE_WEIGHT_RECOMMENDED)), 3
+            ),
             "wall_material": str(getattr(self.room, "wall_material", "")),
             "roof_material": str(getattr(self.room, "roof_material", "")),
         }
@@ -2036,6 +2240,39 @@ class Main(QtWidgets.QMainWindow):
             3500,
         )
         self.view3d.update()
+
+    def _on_tone_fader(self, attr: str, v: int, lbl: QtWidgets.QLabel):
+        """Generic 0..100 slider → 0..1 drop-tone parameter (live)."""
+        x = max(0.0, min(1.0, v / 100.0))
+        setattr(self.room, attr, x)
+        lbl.setText(f"{x:.0%}")
+
+    def _sync_tone_sliders(self):
+        if not hasattr(self, "sld_tone_pitch"):
+            return
+        pairs = (
+            ("tone_pitch", self.sld_tone_pitch, self.lbl_tone_pitch, TONE_PITCH_RECOMMENDED),
+            ("tone_ring", self.sld_tone_ring, self.lbl_tone_ring, TONE_RING_RECOMMENDED),
+            ("tone_wet", self.sld_tone_wet, self.lbl_tone_wet, TONE_WET_RECOMMENDED),
+            ("tone_soft", self.sld_tone_soft, self.lbl_tone_soft, TONE_SOFT_RECOMMENDED),
+            ("tone_weight", self.sld_tone_weight, self.lbl_tone_weight, TONE_WEIGHT_RECOMMENDED),
+        )
+        for attr, sld, lbl, default in pairs:
+            x = float(getattr(self.room, attr, default))
+            sld.blockSignals(True)
+            sld.setValue(int(round(x * 100)))
+            sld.blockSignals(False)
+            lbl.setText(f"{x:.0%}")
+
+    def _reset_tone_defaults(self):
+        """Restore recommended drop tone (does not change mix / volume)."""
+        self.room.tone_pitch = TONE_PITCH_RECOMMENDED
+        self.room.tone_ring = TONE_RING_RECOMMENDED
+        self.room.tone_wet = TONE_WET_RECOMMENDED
+        self.room.tone_soft = TONE_SOFT_RECOMMENDED
+        self.room.tone_weight = TONE_WEIGHT_RECOMMENDED
+        self._sync_tone_sliders()
+        self.statusBar().showMessage("Drop sound reset to recommended", 3000)
 
     def _on_volume(self, v: int):
         self.room.master_volume = max(0.0, min(1.0, v / 100.0))
@@ -2264,6 +2501,7 @@ class Main(QtWidgets.QMainWindow):
         self.engine.set_volume(vol)
         self.floor.set_room(self.room)
         self._sync_mix_sliders()
+        self._sync_tone_sliders()
 
     def _load_house(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(

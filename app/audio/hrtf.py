@@ -136,10 +136,13 @@ def apply_hrtf(
     elevation_rad: float = 0.0,
     distance: float = 1.5,
     sr: int = 48000,
+    quality: str = "full",
 ) -> np.ndarray:
     """Mono → stereo binaural using parametric HRTF cues.
 
     az 0 = front, negative = left, positive = right (listener-relative).
+    quality='fast' keeps ILD + ITD (and a rear-gain darken) — used when the
+    mixer is spawning many chained droplets.
     """
     x = np.asarray(mono_src, dtype=np.float64).reshape(-1)
     n = x.shape[0]
@@ -150,6 +153,9 @@ def apply_hrtf(
     el = float(elevation_rad)
     dist = max(0.2, float(distance))
     sr = int(sr)
+
+    if str(quality).lower() in ("fast", "cheap", "ild"):
+        return _hrtf_fast(x, az, el, dist, sr)
 
     # --- Front / rear factor ---
     front = math.cos(az)  # +1 front, -1 rear
@@ -249,6 +255,50 @@ def apply_hrtf(
     elev_k = 0.88 + 0.12 * math.cos(el)
     y = np.column_stack([x_l * gL * att * elev_k, x_r * gR * att * elev_k])
     return y
+
+
+def _hrtf_fast(
+    x: np.ndarray,
+    az: float,
+    el: float,
+    dist: float,
+    sr: int,
+) -> np.ndarray:
+    """ILD + integer ITD + rear gain darken. No per-ear filter bank."""
+    ild = ild_db(az, el)
+    near = 1.0 + 0.55 * max(0.0, (1.2 - dist) / 1.2)
+    ild *= near
+    gL = 10.0 ** ((-ild) / 20.0)
+    gR = 10.0 ** ((+ild) / 20.0)
+    pan = math.sin(az)
+    eqL = math.cos((pan + 1.0) * 0.25 * math.pi)
+    eqR = math.sin((pan + 1.0) * 0.25 * math.pi)
+    gL = 0.55 * gL + 0.45 * eqL
+    gR = 0.55 * gR + 0.45 * eqR
+    pnorm = math.sqrt(gL * gL + gR * gR) + 1e-12
+    gL *= math.sqrt(2.0) / pnorm
+    gR *= math.sqrt(2.0) / pnorm
+    rear = max(0.0, -math.cos(az))
+    dark = 1.0 - 0.22 * rear
+    if dist <= 0.8:
+        att = 1.0
+    else:
+        att = 0.8 / (0.8 + (dist - 0.8))
+    itd_s = woodworth_itd_s(az)
+    delay_r = max(0.0, itd_s) * sr
+    delay_l = max(0.0, -itd_s) * sr
+
+    def _idelay(sig: np.ndarray, d: float) -> np.ndarray:
+        di = int(round(d))
+        if di <= 0:
+            return sig
+        y = np.zeros_like(sig)
+        if di < len(sig):
+            y[di:] = sig[: len(sig) - di]
+        return y
+
+    k = att * dark
+    return np.column_stack([_idelay(x, delay_l) * gL * k, _idelay(x, delay_r) * gR * k])
 
 
 def hrtf_gains_preview(azimuth_rad: float, elevation_rad: float = 0.0) -> Tuple[float, float, float]:
