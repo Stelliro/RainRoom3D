@@ -11,9 +11,9 @@
 |---|---|
 | **Repo** | [github.com/Stelliro/RainRoom3D](https://github.com/Stelliro/RainRoom3D) |
 | **Default layout** | [`configs/my_house.json`](configs/my_house.json) (Living Room) |
-| **License** | [PolyForm Noncommercial 1.0.0](LICENSE) — **no commercial use** |
+| **License** | [PolyForm Noncommercial 1.0.0](LICENSE) |
 
-> **Work in progress.** Spatial rain, multi-device routing, and the editor are actively evolving. Expect rough edges. Noncommercial use and feedback welcome.
+> **Work in progress.** Spatial rain, multi-device routing, and the editor are actively evolving. Expect rough edges.
 
 <p align="center">
   <img src="docs/media/hero_app.jpg" alt="RainRoom3D — Design house floor plan (actual app screenshot)" width="920" />
@@ -25,17 +25,16 @@
   <img src="docs/media/screenshot_simulate.jpg" alt="Simulate rain controls (actual app screenshot)" width="450" />
 </p>
 
-*All images above are **real screenshots** of the running app (not mockups).*
-
 ---
 
 ## Status — work in progress
 
-RainRoom3D is a personal **Windows** experiment for spatial outdoor rain. It is **not** a finished commercial product.
+RainRoom3D is a personal **Windows** experiment for spatial outdoor rain.
 
 | Ready enough to try | Still rough |
 |---------------------|-------------|
-| House / window / speaker editor | Rain timbre (wet vs wash) still tuning |
+| House / window / speaker editor | Other roof/wall timbres still tuning |
+| **Tin roof rain** — wet ticks on the house (WIP) | Downpour density / other materials |
 | Binaural **You** + multi-device speakers | Multi-device depends on your OS devices |
 | Quantity · sharpness · volume · wind · **sound mix** | OpenGL vs software 3D varies by GPU |
 | Default Living Room layout | No first-class macOS / Linux support |
@@ -46,7 +45,8 @@ RainRoom3D is a personal **Windows** experiment for spatial outdoor rain. It is 
 
 - **Design** a house on outdoor terrain — footprint, materials, windows (open style, sill, hinge)  
 - Place **You** (binaural listener) and **speakers**, assign real OS output devices  
-- **Simulate** outdoor rain: continuous wash + soft wet impacts, depth layers (near/mid/far/roof/canopy)  
+- **Simulate** outdoor rain over the house footprint (roof + a thin eaves ring)  
+- 3D droplets land as stacked wet ticks; tin is impact + dispersion, not a noise bed  
 - Rain couples through **open windows** (distance, delay, air absorption)  
 - **Sound mix** prefs (wash · droplets · room echo · wind air) — saved with the house  
 - **Play as You**, **mapped speakers**, or **You + speakers**  
@@ -132,18 +132,10 @@ powershell -ExecutionPolicy Bypass -File scripts/package_source_zip.ps1
 
 ## License
 
-**[PolyForm Noncommercial License 1.0.0](LICENSE)** — Copyright (c) 2026 Stelliro.
-
-| Allowed | Not allowed |
-|---------|-------------|
-| Personal use, hobby, study | **Commercial use** |
-| Modify & share (keep notices) | Selling or monetizing this / derivatives |
-| Research / noncommercial orgs (as defined) | Sublicensing for commercial purposes |
-
-**No one may use this project to make money.** Full text: [LICENSE](LICENSE).
+[PolyForm Noncommercial License 1.0.0](LICENSE) — Copyright (c) 2026 Stelliro.
 
 ---
 
 ## Contributing / feedback
 
-This is a **WIP** personal project. Issues and noncommercial experiments are welcome — please respect the noncommercial license.
+This is a **WIP** personal project. Issues and feedback are welcome.

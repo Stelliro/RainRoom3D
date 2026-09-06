@@ -67,8 +67,10 @@ class Room3DView(QtWidgets.QWidget):
         self._drag_screen0: Optional[Tuple[float, float]] = None
         self._gizmo_len = 0.55  # meters
 
-        # Subtle rain animation
+        # Subtle rain animation (persistent streaks — not re-rolled every frame)
         self._t = 0.0
+        self._rain = []  # [x, y, z, vy, kind] house-centered
+        self._max_rain = 180
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)
@@ -77,6 +79,7 @@ class Room3DView(QtWidgets.QWidget):
     def set_room(self, room):
         first = self.room is None
         self.room = room
+        self._init_rain()
         if first:
             self.fit_camera()
         else:
@@ -923,26 +926,107 @@ class Room3DView(QtWidgets.QWidget):
             L = self.room.listener
             self._draw_gizmo(p, (float(L.x), float(L.y), float(L.z)), prefix="lis")
 
-    def _draw_rain(self, p, rw, rd, rh):
+    def _rain_target(self) -> int:
+        dens = max(0.08, float(getattr(self.room, "droplet_density", 0.5)))
+        n = int(40 + 140 * (dens ** 0.55))
+        return max(24, min(self._max_rain, n))
+
+    def _spawn_one_streak(self, rw, rd, rh):
         import random
-        rng = random.Random(int(self._t * 10) % 10000)
+        half_w, half_d = rw * 0.5, rd * 0.5
+        u = random.random()
+        if u < 0.34:
+            x = random.uniform(-half_w, half_w)
+            z = random.uniform(-half_d, half_d)
+            y = rh + random.uniform(0.3, 3.2)
+            kind = 3
+        elif u < 0.88:
+            dist = random.uniform(0.25, max(rw, rd) * 1.6)
+            per = 2.0 * ((rw + 2.0 * dist) + (rd + 2.0 * dist))
+            t = random.uniform(0.0, per)
+            pw = rw + 2.0 * dist
+            pd = rd + 2.0 * dist
+            if t < pw:
+                x, z = t - dist - half_w, half_d + dist
+            else:
+                t -= pw
+                if t < pd:
+                    x, z = half_w + dist, t - dist - half_d
+                else:
+                    t -= pd
+                    if t < pw:
+                        x, z = half_w + dist - t, -half_d - dist
+                    else:
+                        t -= pw
+                        x, z = -half_w - dist, half_d + dist - t
+            y = random.uniform(0.4, rh + 3.0)
+            kind = 1
+        else:
+            R = max(rw, rd) * 2.2
+            x = random.uniform(-R, R)
+            z = random.uniform(-R, R)
+            y = random.uniform(0.5, rh + 3.0)
+            kind = 1
+        return [x, y, z, random.uniform(-3.0, -5.0), kind]
+
+    def _init_rain(self):
+        self._rain = []
+        if not self.room:
+            return
+        rw = float(self.room.width)
+        rd = float(self.room.depth)
+        rh = float(self.room.height)
+        for _ in range(self._rain_target()):
+            self._rain.append(self._spawn_one_streak(rw, rd, rh))
+
+    def _draw_rain(self, p, rw, rd, rh):
+        if not self._rain:
+            return
         p.setPen(QtGui.QPen(QtGui.QColor(160, 200, 255, 90), 1))
-        intensity = float(getattr(self.room, "rain_intensity", 0.5))
-        n = int(40 + 120 * intensity)
-        R = max(rw, rd) * 2.5
-        for _ in range(n):
-            x = rng.uniform(-R, R)
-            z = rng.uniform(-R, R)
-            y = rng.uniform(0.5, rh + 3.0)
+        for drop in self._rain:
+            x, y, z = drop[0], drop[1], drop[2]
             a = self._project((x, y, z))
-            b = self._project((x, y - 0.35, z))
+            b = self._project((x, y - 0.32, z))
             if a and b:
                 p.drawLine(a, b)
 
     def _tick(self):
         self._t += 0.033
-        if self.room and self.isVisible() and self._drag_mode is None:
-            self.update()
+        if not (self.room and self.isVisible() and self._drag_mode is None):
+            return
+        rw = float(self.room.width)
+        rd = float(self.room.depth)
+        rh = float(self.room.height)
+        if not self._rain:
+            self._init_rain()
+        wx = wz = 0.0
+        try:
+            from app.models.room import Room
+            spd = float(getattr(self.room, "wind_speed", 0.0))
+            deg = float(getattr(self.room, "wind_direction_deg", 90.0))
+            wx, wz = Room.wind_push_xz(spd, deg)
+            wx *= 2.0
+            wz *= 2.0
+        except Exception:
+            pass
+        dt = 0.033
+        target = self._rain_target()
+        alive = []
+        for drop in self._rain:
+            drop[0] += wx * dt
+            drop[1] += drop[3] * dt
+            drop[2] += wz * dt
+            ground = rh + 0.02 if drop[4] == 3 else 0.0
+            if drop[1] <= ground:
+                alive.append(self._spawn_one_streak(rw, rd, rh))
+            else:
+                alive.append(drop)
+        while len(alive) < target:
+            alive.append(self._spawn_one_streak(rw, rd, rh))
+        if len(alive) > self._max_rain:
+            alive = alive[: self._max_rain]
+        self._rain = alive
+        self.update()
 
     # ----- handles / hit testing -----
     def _window_handle_points(self, quad: List[QtCore.QPointF]) -> dict:

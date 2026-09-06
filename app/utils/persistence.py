@@ -13,6 +13,11 @@ from app.models.room import (
     MIX_REVERB_RECOMMENDED,
     MIX_WASH_RECOMMENDED,
     MIX_WIND_RECOMMENDED,
+    TONE_PITCH_RECOMMENDED,
+    TONE_RING_RECOMMENDED,
+    TONE_SOFT_RECOMMENDED,
+    TONE_WET_RECOMMENDED,
+    TONE_WEIGHT_RECOMMENDED,
     Room,
     Speaker,
     Window,
@@ -143,6 +148,36 @@ def load_room(path: str) -> Room:
         mix_wind=float(
             rain.get("mix_wind", data.get("mix", {}).get("wind", MIX_WIND_RECOMMENDED))
         ),
+        tone_pitch=float(
+            rain.get(
+                "tone_pitch",
+                data.get("tone", {}).get("pitch", TONE_PITCH_RECOMMENDED),
+            )
+        ),
+        tone_ring=float(
+            rain.get(
+                "tone_ring",
+                data.get("tone", {}).get("ring", TONE_RING_RECOMMENDED),
+            )
+        ),
+        tone_wet=float(
+            rain.get(
+                "tone_wet",
+                data.get("tone", {}).get("wet", TONE_WET_RECOMMENDED),
+            )
+        ),
+        tone_soft=float(
+            rain.get(
+                "tone_soft",
+                data.get("tone", {}).get("soft", TONE_SOFT_RECOMMENDED),
+            )
+        ),
+        tone_weight=float(
+            rain.get(
+                "tone_weight",
+                data.get("tone", {}).get("weight", TONE_WEIGHT_RECOMMENDED),
+            )
+        ),
     )
     # Legacy-only wind field (no speed/dir keys): map signed EW
     if "wind_speed" not in rain and "wind" in rain:
@@ -239,6 +274,11 @@ def save_room(room: Room, path: str) -> None:
             "mix_droplets": float(getattr(room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)),
             "mix_reverb": float(getattr(room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
             "mix_wind": float(getattr(room, "mix_wind", MIX_WIND_RECOMMENDED)),
+            "tone_pitch": float(getattr(room, "tone_pitch", TONE_PITCH_RECOMMENDED)),
+            "tone_ring": float(getattr(room, "tone_ring", TONE_RING_RECOMMENDED)),
+            "tone_wet": float(getattr(room, "tone_wet", TONE_WET_RECOMMENDED)),
+            "tone_soft": float(getattr(room, "tone_soft", TONE_SOFT_RECOMMENDED)),
+            "tone_weight": float(getattr(room, "tone_weight", TONE_WEIGHT_RECOMMENDED)),
         },
         "master_volume": float(getattr(room, "master_volume", 0.75)),
         # Flat mix block for easy hand-edit / share (same values as rain.*)
@@ -250,6 +290,14 @@ def save_room(room: Room, path: str) -> None:
             "master": float(getattr(room, "master_volume", 0.75)),
             "quantity": float(getattr(room, "droplet_density", 0.55)),
             "sharpness": float(getattr(room, "rain_intensity", 0.35)),
+        },
+        # Ear-lab drop tone (same values as rain.tone_*)
+        "tone": {
+            "pitch": float(getattr(room, "tone_pitch", TONE_PITCH_RECOMMENDED)),
+            "ring": float(getattr(room, "tone_ring", TONE_RING_RECOMMENDED)),
+            "wet": float(getattr(room, "tone_wet", TONE_WET_RECOMMENDED)),
+            "soft": float(getattr(room, "tone_soft", TONE_SOFT_RECOMMENDED)),
+            "weight": float(getattr(room, "tone_weight", TONE_WEIGHT_RECOMMENDED)),
         },
     }
     with open(path, "w", encoding="utf-8") as f:

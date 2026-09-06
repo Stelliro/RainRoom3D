@@ -289,13 +289,13 @@ class OutdoorFieldBed:
         q = max(0.0, min(1.0, float(quantity)))
         sh = max(0.0, min(1.0, float(sharpness)))
         wt = max(0.0, min(1.0, float(wall_tone)))
-        if q < 0.008 or level <= 0:
+        if q <= 0.0005 or level <= 0:
             self.t += n / max(1, self.sr)
             return empty
 
         sr = self.sr
-        # dens drives bed mass with Quantity (0 → almost off, 1 → full wash)
-        dens = q ** 0.80
+        # Drizzle still has a wet bed. Quantity thickens it; 0% is off.
+        dens = 0.20 + 0.80 * (q ** 0.70)
 
         w1 = self.rng.randn(n).astype(np.float64)
         w2 = self.rng.randn(n).astype(np.float64)
@@ -313,8 +313,8 @@ class OutdoorFieldBed:
 
         # Band pitch: sharpness primary, wall_tone a gentle nudge (~±15%)
         wall_k = 0.88 + 0.28 * wt
-        body_fc = (420.0 + 1200.0 * sh) * wall_k       # stay wetter overall
-        mid_fc = (750.0 + 1800.0 * sh) * wall_k
+        body_fc = (340.0 + 420.0 * sh) * wall_k
+        mid_fc = (520.0 + 580.0 * sh) * wall_k
         body, self._lp_body = _lp(0.80 * brown + 0.20 * brown2, body_fc, sr, self._lp_body)
         mid_src, self._lp_mid = _lp(0.55 * brown + 0.45 * brown2, mid_fc, sr, self._lp_mid)
 
@@ -345,10 +345,9 @@ class OutdoorFieldBed:
         sheen, self._lp_sheen = _lp(sheen, sheen_lp, sr, self._lp_sheen)
         sheen, self._lp_sheen2 = _lp(sheen, sheen_lp * 0.92, sr, self._lp_sheen2)
         # Sheen tracks density; wall_tone a small gain nudge only
-        sheen_g = (0.010 + 0.12 * dens) * (0.08 + 0.75 * (sh ** 0.85)) * (0.90 + 0.18 * wt)
+        sheen_g = 0.0
 
-        # Sparse high sparkles — fewer at low dens so wet notes stay clear
-        spark_rate = 1.0 + 40.0 * dens * (0.15 + 0.85 * sh) + 18.0 * sh * dens
+        spark_rate = 0.0
         p_spark = min(0.03, spark_rate / sr)
         spark_mask = self.rng.rand(n) < p_spark
         sparks = np.zeros(n, dtype=np.float64)
@@ -358,9 +357,9 @@ class OutdoorFieldBed:
         spark_lp = 3500.0 + 4000.0 * sh
         sparks, self._lp_spark = _lp(sparks, spark_lp, sr, self._lp_spark)
         sparks, self._hp_y, self._hp_x = _hp(sparks, 1800.0 + 600.0 * sh, sr, self._hp_y, self._hp_x)
-        spark_g = (0.012 + 0.11 * dens) * (0.08 + 0.92 * (sh ** 1.1))
+        spark_g = 0.0
 
-        high_mix = sheen_g * sheen + spark_g * sparks
+        high_mix = 0.0 * sheen  # keep sheen filter state advancing; no HF hiss on the bed
 
         # Soft mid-band patter only when no samples (samples already textured)
         has_samples = bool(self._bank and self._bank.ok and self._sample_wet > 0.02)
@@ -388,16 +387,15 @@ class OutdoorFieldBed:
 
         # Depth colouring — near keeps more sheen; far stays darker
         near = core + (0.0 if has_samples else (0.04 + 0.08 * dens)) * ticks + 0.35 * high_mix
-        near, self._lp_near = _lp(near, 1800.0 + 4200.0 * sh, sr, self._lp_near)
+        near, self._lp_near = _lp(near, 1100.0 + 700.0 * sh, sr, self._lp_near)
 
         mid = 0.78 * core + 0.18 * brown2 + 0.55 * high_mix
         if has_samples:
             self._bank.set_density(dens)
             samp = self._bank.render(n)
             # Open sample top with sharpness so loops don't stay dull
-            samp, _ = _lp(samp, 3600.0 + 4200.0 * sh, sr, 0.0)
-            w = self._sample_wet * (0.50 + 0.38 * dens)
-            w = min(0.88, w)  # leave room for live sheen
+            samp, _ = _lp(samp, 1600.0 + 800.0 * sh, sr, 0.0)
+            w = min(0.93, 0.38 + 0.55 * dens)
             mid = (1.0 - w) * mid + w * samp + 0.45 * high_mix
             near = (1.0 - 0.50 * w) * near + 0.50 * w * samp + 0.25 * high_mix
             far_src = samp
@@ -413,7 +411,7 @@ class OutdoorFieldBed:
             + (0.25 if has_samples else 0.0) * mid
             + 0.70 * high_mix
         )
-        canopy, self._lp_can = _lp(canopy, 1400.0 + 3600.0 * sh, sr, self._lp_can)
+        canopy, self._lp_can = _lp(canopy, 900.0 + 700.0 * sh, sr, self._lp_can)
 
         # Slow weather AM
         t0 = self.t

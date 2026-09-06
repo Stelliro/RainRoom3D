@@ -130,9 +130,11 @@ class OutdoorFieldRouter:
         # layer → list of path dicts
         self._speaker_paths: Dict[str, List[dict]] = {}
         self._listener_paths: Dict[str, List[dict]] = {}
+        self._wall_paths: Dict[str, List[dict]] = {}
         self._fingerprint: Optional[tuple] = None
         self._max_delay = int(0.18 * self.sr)
         self._lp_state: Dict[str, float] = {"near": 0.0, "mid": 0.0, "far": 0.0, "leak": 0.0}
+        self.last_wall: Dict[str, np.ndarray] = {}
 
     def _room_fingerprint(self, room) -> tuple:
         wins = []
@@ -168,6 +170,7 @@ class OutdoorFieldRouter:
         sr = self.sr
         self._speaker_paths = {k: [] for k in _LAYER_DEPTH_M}
         self._listener_paths = {k: [] for k in _LAYER_DEPTH_M}
+        self._wall_paths = {k: [] for k in _LAYER_DEPTH_M}
         windows = list(getattr(room, "windows", []) or [])
         speakers = list(getattr(room, "speakers", []) or [])
         L = room.listener
@@ -246,6 +249,14 @@ class OutdoorFieldRouter:
                         "dl": _DelayLine(self._max_delay + 8),
                     })
 
+                # Portal bus for surround wrap (no indoor mic distance)
+                self._wall_paths[layer].append({
+                    "wall": wall.lower(),
+                    "gain": portal_g * 0.42,
+                    "delay": min(self._max_delay, delay_out_n),
+                    "dl": _DelayLine(self._max_delay + 8),
+                })
+
                 d_in = max(0.12, _len(_sub(listener, ap)))
                 att_in = distance_attenuation(d_in, ref=0.45, rolloff=1.15)
                 # Almost no near boost — multi-window stack was drowning drops on headphones
@@ -282,12 +293,13 @@ class OutdoorFieldRouter:
         render_listener: bool = True,
     ) -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
         """Back-compat: single mono outdoor field as 'mid' layer."""
-        return self.process_layers(
+        spk, bi, _wall = self.process_layers(
             room,
             {"mid": outdoor_mono},
             n_speakers=n_speakers,
             render_listener=render_listener,
         )
+        return spk, bi
 
     def process_layers(
         self,
@@ -295,8 +307,11 @@ class OutdoorFieldRouter:
         layers: Dict[str, np.ndarray],
         n_speakers: int,
         render_listener: bool = True,
-    ) -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
-        """Route multi-depth outdoor layers through window portals."""
+    ) -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray], Dict[str, np.ndarray]]:
+        """Route multi-depth outdoor layers through window portals.
+
+        Third return is per-wall portal energy for surround upmix.
+        """
         # determine frames
         frames = 0
         for v in layers.values():
@@ -304,9 +319,14 @@ class OutdoorFieldRouter:
         spk_out: Dict[int, np.ndarray] = {
             i: np.zeros(frames, dtype=np.float64) for i in range(max(1, n_speakers))
         }
+        wall_out: Dict[str, np.ndarray] = {
+            w: np.zeros(frames, dtype=np.float64)
+            for w in ("north", "east", "south", "west")
+        }
         bi = np.zeros((frames, 2), dtype=np.float64) if render_listener else None
         if frames == 0:
-            return spk_out, bi
+            self.last_wall = wall_out
+            return spk_out, bi, wall_out
 
         self.ensure(room)
         any_paths = any(self._speaker_paths.get(k) or self._listener_paths.get(k) for k in _LAYER_DEPTH_M)
@@ -327,7 +347,8 @@ class OutdoorFieldRouter:
             if bi is not None:
                 bi[:, 0] = dark * 0.95
                 bi[:, 1] = dark * 1.05
-            return spk_out, bi
+            self.last_wall = wall_out
+            return spk_out, bi, wall_out
 
         # Fold canopy→near and keep mid/far so we route 3 depth streams max
         # (depth colour already baked into the layer audio).
@@ -379,6 +400,13 @@ class OutdoorFieldRouter:
                     spk_out[si] = np.zeros(frames, dtype=np.float64)
                 spk_out[si] += y
 
+            for p in self._wall_paths.get(layer, []):
+                y = p["dl"].process(x_spk * p["gain"], p["delay"])
+                wname = str(p.get("wall", "north") or "north")
+                if wname not in wall_out:
+                    wall_out[wname] = np.zeros(frames, dtype=np.float64)
+                wall_out[wname] += y
+
             if bi is not None:
                 for p in self._listener_paths.get(layer, []):
                     y = p["dl"].process(x_bi * p["gain"], p["delay"])
@@ -390,13 +418,14 @@ class OutdoorFieldRouter:
         # (peak alone left continuous ocean energy that buried droplets)
         if bi is not None:
             pk = float(np.max(np.abs(bi)) + 1e-12)
-            if pk > 0.055:
-                bi *= 0.055 / pk
+            if pk > 0.28:
+                bi *= 0.28 / pk
             rms = float(np.sqrt(np.mean(bi * bi)) + 1e-12)
-            if rms > 0.016:
-                bi *= 0.016 / rms
+            if rms > 0.085:
+                bi *= 0.085 / rms
 
-        return spk_out, bi
+        self.last_wall = wall_out
+        return spk_out, bi, wall_out
 
     def reset(self):
         self._fingerprint = None

@@ -1,0 +1,8 @@
+v0.2.0-wip — tin roof actually sounds like rain (still WIP).
+
+- Visual 3D landings drive stacked droplet ticks (drop bank).
+- Tin: wet impact + delayed smear. Not jewelry ding, not plastic clack, not wood thud.
+- Glass panes sit above puddle-water and below tin.
+- Quantity 0 = off. Downpour is a sheet of ticks on the house, not a 40 m field.
+- Spawn confined to room footprint + thin eaves ring.
+- Tests: python -m app.tools.test_rain_spatial

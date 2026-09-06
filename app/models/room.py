@@ -22,6 +22,14 @@ MIX_DROPLETS_RECOMMENDED = 2.0
 MIX_REVERB_RECOMMENDED = 1.0
 MIX_WIND_RECOMMENDED = 1.0
 
+# Drop-tone lab (0..1). 0.5 ≈ neutral / current engine default character.
+# Plain-language “what each hit sounds like” — not music theory.
+TONE_PITCH_RECOMMENDED = 0.50    # 0 deep / low  →  1 high / bright
+TONE_RING_RECOMMENDED = 0.30      # 0 pure thump  →  1 more “plink” note
+TONE_WET_RECOMMENDED = 0.85       # 0 drier tick  →  1 wet splash
+TONE_SOFT_RECOMMENDED = 0.55      # 0 snappy      →  1 soft / rounded
+TONE_WEIGHT_RECOMMENDED = 0.50    # 0 tiny spray  →  1 fat heavy drops
+
 
 @dataclass
 class Speaker:
@@ -276,6 +284,13 @@ class Room:
     mix_droplets: float = MIX_DROPLETS_RECOMMENDED
     mix_reverb: float = MIX_REVERB_RECOMMENDED
     mix_wind: float = MIX_WIND_RECOMMENDED
+
+    # --- Drop tone lab (0..1; saved with the house; live while rain plays) ---
+    tone_pitch: float = TONE_PITCH_RECOMMENDED
+    tone_ring: float = TONE_RING_RECOMMENDED
+    tone_wet: float = TONE_WET_RECOMMENDED
+    tone_soft: float = TONE_SOFT_RECOMMENDED
+    tone_weight: float = TONE_WEIGHT_RECOMMENDED
 
     # --- Wind (rain is blown TOWARD this direction) ---
     # 0° = North (+Z), 90° = East (+X), 180° = South (−Z), 270° = West (−X)

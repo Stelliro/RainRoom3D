@@ -292,34 +292,34 @@ _SURFACE = {
         bed_gain_db=-12.0,
     ),
     "glass": dict(
-        tone_family="wet",
+        tone_family="glass",
         plop=[1600.0, 2800.0],
-        splash_bp=[1400.0, 2400.0],
-        spray_lp=2200.0,
-        q_base=3.2,
-        decay_ms=12.0,
-        brightness=0.40,
-        slap_lp=2600.0,
-        body_lp=1600.0,
-        plop_chance=0.35,
-        tone_mix=0.14,
-        bed_lp=2800.0,
+        splash_bp=[1400.0, 2800.0],
+        spray_lp=3600.0,
+        q_base=2.4,
+        decay_ms=14.0,
+        brightness=0.62,
+        slap_lp=4200.0,
+        body_lp=2400.0,
+        plop_chance=0.12,
+        tone_mix=0.06,
+        bed_lp=3600.0,
         bed_gain_db=-13.0,
     ),
     "metal": dict(
-        tone_family="wet",
-        plop=[1400.0, 2400.0, 3600.0],
-        splash_bp=[1600.0, 2800.0],
-        spray_lp=2400.0,
-        q_base=3.5,
-        decay_ms=14.0,
-        brightness=0.45,
-        slap_lp=2800.0,
-        body_lp=1700.0,
-        plop_chance=0.40,
-        tone_mix=0.16,
-        bed_lp=3000.0,
-        bed_gain_db=-13.0,
+        tone_family="tin",
+        plop=[700.0, 1400.0],
+        splash_bp=[1100.0, 3400.0],
+        spray_lp=4800.0,
+        q_base=1.8,
+        decay_ms=28.0,
+        brightness=0.58,
+        slap_lp=5600.0,
+        body_lp=2000.0,
+        plop_chance=0.0,
+        tone_mix=0.0,
+        bed_lp=4600.0,
+        bed_gain_db=-14.0,
     ),
     "wood": dict(
         tone_family="wet",
@@ -418,6 +418,7 @@ _SURFACE = {
 for _alias, _target in [
     ("roof", "metal"),
     ("tin", "metal"),
+    ("window", "glass"),
     ("puddle", "water"),
     ("plastic", "tarp"),
     ("hollow", "shell"),
@@ -541,26 +542,55 @@ def _offtone_freqs(surface, size_mm, seed):
     return freqs
 
 
-def _mk_wet_spit(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db=-4.0):
+def _mk_wet_spit(
+    sr,
+    surface,
+    size_mm,
+    seed,
+    wetness=0.9,
+    sharpness=0.35,
+    amp_db=-4.0,
+    tone_pitch=0.5,
+    tone_ring=0.3,
+    tone_soft=0.55,
+):
     """Soft wet water hit — brown-led, dark, no high tarp/plastic.
 
     Avoids mid-pink “tarp slap” and bright HF tips that read as plastic.
       • heavy brown *weight* (water mass)
       • soft low-mid *wet smear* (splash, still dark)
       • tiny sharpness sheen only (very quiet)
+      • optional ear-lab tone controls (pitch / ring / soft)
     """
     sh = max(0.0, min(1.0, float(sharpness)))
     wet = max(0.2, min(1.0, float(wetness)))
     size = max(0.35, float(size_mm))
+    # 0 → deeper / darker, 1 → higher / thinner (ear-lab pitch)
+    pk = max(0.0, min(1.0, float(tone_pitch)))
+    pitch_k = 0.58 + 0.84 * pk  # ~0.58 .. 1.42
+    ring = max(0.0, min(1.0, float(tone_ring)))
+    soft = max(0.0, min(1.0, float(tone_soft)))
     prof = _get_surface(surface)
+    family = str(prof.get("tone_family", "wet")).lower()
+    is_glass = family == "glass" or "glass" in str(surface or "").lower()
     # Surfaces that aren't water stay a touch brighter, but never tarp-bright
     bright = float(prof.get("brightness", 0.22))
     mat = max(0.0, min(1.0, bright))
 
-    # Slow soft attack — no needle / plastic tick
-    attack = 6.5 + 2.5 * wet - 1.2 * sh          # ~5–9 ms
-    decay = 32.0 + 24.0 * wet * (size / 2.5) - 5.0 * sh
-    decay = max(24.0, min(80.0, decay))
+    if is_glass:
+        # Pane: thinner / higher than a puddle, still wet, not a tin tick.
+        pitch_k *= 1.22
+        wet = min(wet, 0.62)
+        soft = min(soft, 0.30)
+        ring = min(ring, 0.08)
+        attack = 2.1 + 1.4 * wet - 0.45 * sh + 2.2 * soft
+        decay = 16.0 + 12.0 * wet * (size / 2.5) - 3.0 * sh + 6.0 * soft
+        decay = max(14.0, min(34.0, decay))
+    else:
+        # Slow soft attack — no needle / plastic tick; tone_soft lengthens further
+        attack = 6.5 + 2.5 * wet - 1.2 * sh + 5.0 * soft   # ~5–14 ms
+        decay = 32.0 + 24.0 * wet * (size / 2.5) - 5.0 * sh + 10.0 * soft
+        decay = max(24.0, min(95.0, decay))
     n = max(192, int(sr * (attack + decay + 6.0) / 1000.0))
 
     white = _det_noise(n, seed * 1000 + 9)
@@ -568,22 +598,33 @@ def _mk_wet_spit(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db
     pink = _pinkish(white)
 
     # --- weight: brown water body (main character) ---
-    weight = (0.92 - 0.08 * mat) * brown + (0.08 + 0.08 * mat) * pink
-    weight = _hp1(weight, 45.0 + 25.0 * sh, sr)
-    # Keep body dark — high LP was the “tarp” zone
-    body_lp = 520.0 + 380.0 * sh + 40.0 * size + 120.0 * mat
+    if is_glass:
+        weight = 0.40 * brown + 0.60 * pink
+        hp_body = (150.0 + 90.0 * sh) * pitch_k
+        body_lp = (1450.0 + 850.0 * sh + 50.0 * size) * pitch_k
+    else:
+        weight = (0.92 - 0.08 * mat) * brown + (0.08 + 0.08 * mat) * pink
+        hp_body = (45.0 + 25.0 * sh) * pitch_k
+        body_lp = (520.0 + 380.0 * sh + 40.0 * size + 120.0 * mat) * pitch_k
+    weight = _hp1(weight, hp_body, sr)
     weight = _lp1(weight, body_lp, sr)
-    w_env = _soft_env(n, sr, attack_ms=attack + 1.5, decay_ms=decay, hold_ms=2.0)
+    w_env = _soft_env(n, sr, attack_ms=attack + (0.6 if is_glass else 1.5), decay_ms=decay, hold_ms=1.0 if is_glass else 2.0)
     weight = _rms_scale(weight * w_env, 0.11)
 
     # --- wet smear: soft low-mid only (not bright pink mid formant) ---
-    smear = 0.78 * brown + 0.22 * pink
-    smear = _hp1(smear, 90.0 + 40.0 * sh, sr)
-    mid_lo = 160.0 + 60.0 * sh
-    mid_hi = 700.0 + 550.0 * sh + 200.0 * mat   # was ~1400–3000 → tarp
+    if is_glass:
+        smear = 0.42 * brown + 0.58 * pink
+        smear = _hp1(smear, (220.0 + 100.0 * sh) * pitch_k, sr)
+        mid_lo = (320.0 + 140.0 * sh) * pitch_k
+        mid_hi = (1600.0 + 1100.0 * sh) * pitch_k
+    else:
+        smear = 0.78 * brown + 0.22 * pink
+        smear = _hp1(smear, (90.0 + 40.0 * sh) * pitch_k, sr)
+        mid_lo = (160.0 + 60.0 * sh) * pitch_k
+        mid_hi = (700.0 + 550.0 * sh + 200.0 * mat) * pitch_k
     smear = _lp1(smear, mid_hi, sr)
     smear = _hp1(smear, mid_lo, sr)
-    s_att = attack + 2.0
+    s_att = attack + (1.0 if is_glass else 2.0)
     s_dec = decay * (0.80 + 0.12 * wet)
     s_env = _soft_env(n, sr, attack_ms=s_att, decay_ms=s_dec, hold_ms=1.5)
     pre = min(n // 4, max(0, int(sr * (0.002 + 0.001 * size))))
@@ -596,26 +637,64 @@ def _mk_wet_spit(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db
 
     # --- sharpness sheen: very quiet, dark-capped (not plastic tip) ---
     sheen = np.zeros(n, dtype=np.float64)
-    if sh > 0.20:
+    sheen_on = sh > (0.08 if is_glass else 0.20)
+    if sheen_on:
         sh_n = min(n, max(48, int(sr * (0.012 + 0.016 * sh))))
         tw = _det_noise(sh_n, seed * 1000 + 11)
-        tip = 0.75 * _brownish(tw) + 0.25 * _pinkish(tw)
-        tip = _hp1(tip, 500.0 + 300.0 * sh, sr)
-        tip = _lp1(tip, 1400.0 + 1200.0 * sh, sr)  # hard ceiling vs old 2.8–5.6 kHz
-        tip *= _soft_env(sh_n, sr, attack_ms=4.0 + 1.5 * sh, decay_ms=12.0 + 10.0 * sh, hold_ms=0.8)
-        tip = _rms_scale(tip, 0.018 + 0.016 * sh)
+        if is_glass:
+            tip = 0.35 * _brownish(tw) + 0.65 * _pinkish(tw)
+            tip = _hp1(tip, (900.0 + 400.0 * sh) * pitch_k, sr)
+            tip = _lp1(tip, (2800.0 + 1400.0 * sh) * pitch_k, sr)
+            tip *= _soft_env(sh_n, sr, attack_ms=1.6 + 0.8 * sh, decay_ms=8.0 + 6.0 * sh, hold_ms=0.4)
+            tip = _rms_scale(tip, 0.028 + 0.022 * sh)
+        else:
+            tip = 0.75 * _brownish(tw) + 0.25 * _pinkish(tw)
+            tip = _hp1(tip, (500.0 + 300.0 * sh) * pitch_k, sr)
+            tip = _lp1(tip, (1400.0 + 1200.0 * sh) * pitch_k, sr)
+            tip *= _soft_env(sh_n, sr, attack_ms=4.0 + 1.5 * sh, decay_ms=12.0 + 10.0 * sh, hold_ms=0.8)
+            tip = _rms_scale(tip, 0.018 + 0.016 * sh)
         off = min(n // 5, max(0, int(0.002 * sr)))
         take = min(sh_n, n - off)
         if take > 0:
             sheen[off : off + take] = tip[:take]
 
-    # Weight leads — water mass, not mid formant
-    sheen_g = (0.04 + 0.10 * sh) * min(1.0, 0.5 + 0.5 * size / 2.0)
-    out = 0.68 * weight + 0.30 * smear_sig + sheen_g * sheen
+    # Weight leads — water mass, not mid formant. Glass: more smear, less thud.
+    sheen_g = (0.04 + 0.10 * sh) * min(1.0, 0.5 + 0.5 * size / 2.0) * (1.0 - 0.65 * soft)
+    if is_glass:
+        sheen_g = (0.10 + 0.16 * sh) * (1.0 - 0.35 * soft)
+        out = 0.46 * weight + 0.40 * smear_sig + sheen_g * sheen
+    else:
+        out = 0.68 * weight + 0.30 * smear_sig + sheen_g * sheen
 
-    # Keep wet and dark overall
-    out = _hp1(out, 40.0 + 15.0 * sh, sr)
-    out = _lp1(out, 1100.0 + 900.0 * sh + 300.0 * mat, sr)
+    # Optional “note ring” — soft off-tone body so hits can plink more if wanted
+    if ring > 0.04:
+        freqs = _offtone_freqs(surface, size_mm, seed)
+        ring_sig = np.zeros(n, dtype=np.float64)
+        for i, f0 in enumerate(freqs):
+            f = float(f0) * pitch_k
+            if f < 80.0 or f > 4200.0:
+                continue
+            part = _resonator_noise(
+                n,
+                sr,
+                f,
+                q=3.2 + 2.5 * ring,
+                seed=seed * 19 + 7 + i * 31,
+                harm=0.08 * ring,
+                tone_mix=0.06 + 0.28 * ring,
+            )
+            g = (1.0 if i == 0 else 0.5) * (0.7 + 0.3 * _det_u01(seed, 40 + i))
+            ring_sig += g * part
+        r_env = _soft_env(n, sr, attack_ms=attack + 1.0, decay_ms=decay * 0.9, hold_ms=1.0)
+        ring_sig = _rms_scale(ring_sig * r_env, 0.09)
+        out = (1.0 - 0.42 * ring) * out + (0.42 * ring) * ring_sig
+
+    if is_glass:
+        out = _hp1(out, (90.0 + 40.0 * sh) * pitch_k, sr)
+        out = _lp1(out, (3000.0 + 1400.0 * sh) * pitch_k, sr)
+    else:
+        out = _hp1(out, (40.0 + 15.0 * sh) * max(0.75, pitch_k * 0.9), sr)
+        out = _lp1(out, (1100.0 + 900.0 * sh + 300.0 * mat) * pitch_k, sr)
 
     edge = min(int(0.005 * sr), n // 5)
     if edge > 1:
@@ -628,27 +707,147 @@ def _mk_wet_spit(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db
     return _db(amp_db) * (0.62 + 0.32 * (size / 2.5)) * out
 
 
-def _mk_hollow_splat(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db=-5.0):
+def _mk_tin_hit(
+    sr,
+    surface,
+    size_mm,
+    seed,
+    wetness=0.62,
+    sharpness=0.55,
+    amp_db=-3.0,
+    tone_pitch=0.5,
+    tone_ring=0.0,
+    tone_soft=0.28,
+):
+    """Rain on corrugated tin: impact, then water spreading on the sheet.
+
+    A single exponential fade of the same thud reads as 'hit then falloff,
+    never disperses'. Splash dying *faster* than the body also dulls the
+    tail. Plastic clack = dry 6 ms HF needle. Jewelry = narrow 2–4 kHz BP.
+
+    Shape: short wet impact + delayed mid smear (the spread). No sine,
+    no narrow BP.
+    """
+    _ = (surface, tone_ring)
+    sh = max(0.0, min(1.0, float(sharpness)))
+    wet = max(0.35, min(1.0, float(wetness)))
+    size = max(0.35, float(size_mm))
+    pk = max(0.0, min(1.0, float(tone_pitch)))
+    pitch_k = 0.88 + 0.24 * pk
+    soft = max(0.0, min(1.0, float(tone_soft)))
+
+    attack = max(0.55, 0.85 + 1.10 * soft - 0.28 * sh)
+    hit_decay = 9.0 + 4.0 * wet + 5.0 * soft - 1.5 * sh
+    hit_decay = max(7.0, min(16.0, hit_decay))
+    disp_delay_ms = 3.2 + 3.0 * wet + 1.5 * soft
+    disp_attack = 5.0 + 4.5 * wet + 3.0 * soft
+    disp_decay = 24.0 + 14.0 * wet * (size / 2.8) ** 0.4 - 3.0 * sh + 6.0 * soft
+    disp_decay = max(18.0, min(48.0, disp_decay))
+    n = max(
+        256,
+        int(sr * (disp_delay_ms + disp_attack + disp_decay + 10.0) / 1000.0),
+    )
+
+    white = _det_noise(n, seed * 1000 + 3)
+    brown = _brownish(white)
+    pink = _pinkish(white)
+    white2 = _det_noise(n, seed * 1000 + 19)
+
+    # --- impact: water mass + sheet tick (short; this is the hit) ---
+    body = 0.58 * brown + 0.42 * pink
+    body = _hp1(body, (55.0 + 30.0 * sh) * pitch_k, sr)
+    body = _lp1(body, (1250.0 + 700.0 * sh) * pitch_k, sr)
+    b_env = _soft_env(
+        n, sr,
+        attack_ms=attack + 0.6,
+        decay_ms=hit_decay,
+        hold_ms=0.6 + 0.4 * wet,
+    )
+    body = _rms_scale(body * b_env, 0.10)
+
+    tick = 0.48 * white + 0.52 * pink
+    tick = _hp1(tick, (720.0 + 380.0 * sh) * pitch_k, sr)
+    tick = _lp1(tick, (4200.0 + 1800.0 * sh) * pitch_k, sr)
+    t_env = _soft_env(
+        n, sr,
+        attack_ms=attack,
+        decay_ms=hit_decay * 0.85,
+        hold_ms=0.25,
+    )
+    tick = _rms_scale(tick * t_env, 0.085)
+
+    # --- dispersion: water spreading after the hit (slower, wetter, later) ---
+    smear = 0.42 * brown + 0.38 * pink + 0.20 * white2
+    smear = _hp1(smear, (160.0 + 80.0 * sh) * pitch_k, sr)
+    smear = _lp1(smear, (2400.0 + 1100.0 * sh) * pitch_k, sr)
+    d_env = _soft_env(
+        n, sr,
+        attack_ms=disp_attack,
+        decay_ms=disp_decay,
+        hold_ms=1.2 + 1.4 * wet,
+    )
+    delay_n = min(n - 8, max(0, int(sr * disp_delay_ms / 1000.0)))
+    smear_sig = np.zeros(n, dtype=np.float64)
+    if delay_n > 0:
+        smear_sig[delay_n:] = (_rms_scale(smear * d_env, 0.072))[: n - delay_n]
+    else:
+        smear_sig = _rms_scale(smear * d_env, 0.072)
+
+    tick_g = 0.34 + 0.28 * sh
+    body_g = 0.42 - 0.10 * sh
+    disp_g = 0.38 + 0.10 * wet - 0.06 * sh
+    out = body_g * body + tick_g * tick + disp_g * smear_sig
+
+    out = _hp1(out, 45.0, sr)
+    out = _lp1(out, 5000.0 + 1600.0 * sh, sr)
+
+    # Fade-in only. A cosine dump on the tail *is* the 'never disperses' falloff.
+    edge_in = min(int(0.002 * sr), max(4, n // 16))
+    if edge_in > 1:
+        w = 0.5 - 0.5 * np.cos(np.linspace(0.0, math.pi, edge_in))
+        out[:edge_in] *= w
+
+    out = _rms_scale(out, 0.11 + 0.014 * sh)
+    out = _peak_cap(out, 0.27)
+    return _db(amp_db) * (0.72 + 0.22 * (size / 3.0)) * out
+
+
+def _mk_hollow_splat(
+    sr,
+    surface,
+    size_mm,
+    seed,
+    wetness=0.9,
+    sharpness=0.35,
+    amp_db=-5.0,
+    tone_pitch=0.5,
+    tone_ring=0.3,
+    tone_soft=0.55,
+):
     """Tarp / shell cavity hit — mid ring, intentionally hollow. Rare special only."""
     sh = max(0.0, min(1.0, float(sharpness)))
     wet = max(0.2, min(1.0, float(wetness)))
     size = max(0.35, float(size_mm))
+    pk = max(0.0, min(1.0, float(tone_pitch)))
+    pitch_k = 0.58 + 0.84 * pk
+    ring = max(0.0, min(1.0, float(tone_ring)))
+    soft = max(0.0, min(1.0, float(tone_soft)))
     prof = _get_surface(surface)
 
-    attack = 1.8 + 1.0 * wet - 0.5 * sh
+    attack = 1.8 + 1.0 * wet - 0.5 * sh + 3.5 * soft
     decay = float(prof.get("decay_ms", 32.0)) * (0.7 + 0.4 * wet) * (size / 2.8) ** 0.4
-    decay = max(18.0, decay - 4.0 * sh)
+    decay = max(18.0, decay - 4.0 * sh + 8.0 * soft)
     n = max(96, int(sr * (attack + max(12.0, decay)) / 1000.0))
 
     freqs = _offtone_freqs(surface, size_mm, seed)
     q_base = float(prof.get("q_base", 5.5))
-    q = max(3.0, min(7.0, q_base * (0.7 + 0.25 * wet)))
-    tone_mix = float(prof.get("tone_mix", 0.42)) * (0.9 + 0.2 * sh)
+    q = max(3.0, min(8.0, q_base * (0.7 + 0.25 * wet) * (0.85 + 0.35 * ring)))
+    tone_mix = float(prof.get("tone_mix", 0.42)) * (0.9 + 0.2 * sh) * (0.7 + 0.6 * ring)
 
     sig = np.zeros(n, dtype=np.float64)
     for i, f0 in enumerate(freqs):
         part = _resonator_noise(
-            n, sr, f0, q * (1.0 - 0.10 * i),
+            n, sr, float(f0) * pitch_k, q * (1.0 - 0.10 * i),
             seed=seed * 17 + 3 + i * 41,
             harm=0.18,
             tone_mix=tone_mix,
@@ -676,13 +875,35 @@ def _mk_hollow_splat(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, am
     return _db(amp_db) * mat_g * (0.55 + 0.35 * (size / 2.8)) * sig
 
 
-def _mk_offtone_splat(sr, surface, size_mm, seed, wetness=0.9, sharpness=0.35, amp_db=-5.0):
+def _mk_offtone_splat(
+    sr,
+    surface,
+    size_mm,
+    seed,
+    wetness=0.9,
+    sharpness=0.35,
+    amp_db=-5.0,
+    tone_pitch=0.5,
+    tone_ring=0.3,
+    tone_soft=0.55,
+):
     """Dispatch: wet spit (default) vs hollow tarp/shell (rare surfaces)."""
     prof = _get_surface(surface)
     family = str(prof.get("tone_family", "wet")).lower()
+    if family in ("tin", "metal"):
+        return _mk_tin_hit(
+            sr, surface, size_mm, seed, wetness, sharpness, amp_db,
+            tone_pitch=tone_pitch, tone_ring=tone_ring, tone_soft=tone_soft,
+        )
     if family in ("hollow", "tarp", "shell"):
-        return _mk_hollow_splat(sr, surface, size_mm, seed, wetness, sharpness, amp_db)
-    return _mk_wet_spit(sr, surface, size_mm, seed, wetness, sharpness, amp_db)
+        return _mk_hollow_splat(
+            sr, surface, size_mm, seed, wetness, sharpness, amp_db,
+            tone_pitch=tone_pitch, tone_ring=tone_ring, tone_soft=tone_soft,
+        )
+    return _mk_wet_spit(
+        sr, surface, size_mm, seed, wetness, sharpness, amp_db,
+        tone_pitch=tone_pitch, tone_ring=tone_ring, tone_soft=tone_soft,
+    )
 
 
 def _mk_splash(sr, surface, size_mm, splash_db, seed, antimetal, wetness):
@@ -787,37 +1008,78 @@ def synth_drop(
     total_ms=None,
     force_full=False,
     sharpness=None,
+    tone_pitch=None,
+    tone_ring=None,
+    tone_wet=None,
+    tone_soft=None,
 ):
     """One rain impact.
 
     Default **water**: soft wet spit (low bubble plop + dark body).
     **tarp/shell**: hollow cavity (rare specials only).
     Continuous field wash stays separate and quiet under these hits.
+
+    Optional ear-lab tone_* (0..1) shift pitch / ring / wet / soft without
+    needing to understand the DSP.
     """
     S = _ENGINE_STATE
     hp_cut = S["hp_cut"] if hp_cut is None else hp_cut
     sh = 0.35 if sharpness is None else max(0.0, min(1.0, float(sharpness)))
     size = max(0.35, float(size_mm))
     prof = _get_surface(surface)
-    hollow = str(prof.get("tone_family", "wet")).lower() in ("hollow", "tarp", "shell")
+    family = str(prof.get("tone_family", "wet")).lower()
+    hollow = family in ("hollow", "tarp", "shell")
+    tin = family in ("tin", "metal")
+    glass = family == "glass" or "glass" in str(surface or "").lower()
 
-    if hollow:
+    tp = 0.5 if tone_pitch is None else max(0.0, min(1.0, float(tone_pitch)))
+    tr = 0.3 if tone_ring is None else max(0.0, min(1.0, float(tone_ring)))
+    if tin:
+        tw = 0.62 if tone_wet is None else max(0.35, min(1.0, float(tone_wet)))
+        ts = 0.28 if tone_soft is None else max(0.0, min(1.0, float(tone_soft)))
+        tr = 0.0 if tone_ring is None else min(tr, 0.08)
+    elif glass:
+        tw = 0.52 if tone_wet is None else max(0.25, min(1.0, float(tone_wet)))
+        ts = 0.22 if tone_soft is None else max(0.0, min(1.0, float(tone_soft)))
+        tr = 0.06 if tone_ring is None else min(tr, 0.12)
+    else:
+        tw = (0.85 + 0.12 * (1.0 - sh)) if tone_wet is None else max(0.2, min(1.0, float(tone_wet)))
+        ts = 0.55 if tone_soft is None else max(0.0, min(1.0, float(tone_soft)))
+    if wetness is not None:
+        tw = max(0.35 if tin else 0.15, min(1.0, float(wetness)))
+
+    if tin:
+        mono = _mk_tin_hit(
+            sr, surface, size, seed,
+            wetness=tw,
+            sharpness=sh,
+            amp_db=-3.0 + 0.8 * min(1.0, size / 3.0),
+            tone_pitch=tp,
+            tone_ring=tr,
+            tone_soft=ts,
+        )
+    elif hollow:
         mono = _mk_hollow_splat(
             sr, surface, size, seed,
-            wetness=0.75 + 0.2 * (1.0 - sh),
+            wetness=max(0.2, min(1.0, tw * 0.9)),
             sharpness=sh,
             amp_db=-4.0 + 1.0 * min(1.0, size / 3.0),
+            tone_pitch=tp,
+            tone_ring=tr,
+            tone_soft=ts,
         )
     else:
         mono = _mk_wet_spit(
             sr, surface, size, seed,
-            wetness=0.85 + 0.12 * (1.0 - sh),
+            wetness=tw,
             sharpness=sh,
             amp_db=-2.5 + 1.0 * min(1.0, size / 3.0),
+            tone_pitch=tp,
+            tone_ring=tr,
+            tone_soft=ts,
         )
 
-    # Tiny drizzle: quieter, not shorter-to-pop
-    if size < 0.9 and not hollow:
+    if size < 0.9 and not hollow and not tin:
         mono = mono * (0.50 + 0.40 * size)
 
     if total_ms is not None:
@@ -827,16 +1089,27 @@ def synth_drop(
         else:
             mono = mono[:n_want]
 
-    # Wet stays dark (high final LP was re-opening tarp HF). Hollow can be brighter.
-    final_lp = (1000.0 + 900.0 * sh) if not hollow else (1800.0 + 2800.0 * sh)
+    pitch_k = 0.58 + 0.84 * tp
+    if tin:
+        final_lp = 5200.0 + 1600.0 * sh
+    elif glass:
+        final_lp = 3200.0 + 1400.0 * sh
+    elif hollow:
+        final_lp = (1800.0 + 2800.0 * sh) * pitch_k
+    else:
+        final_lp = (1000.0 + 900.0 * sh) * pitch_k
     mono = _lp1(mono, final_lp, sr)
-    if not hollow:
-        mono = _hp1(mono, 40.0 + 12.0 * sh, sr)
+    if tin:
+        mono = _hp1(mono, 48.0 + 20.0 * sh, sr)
+    elif glass:
+        mono = _hp1(mono, 80.0 + 40.0 * sh, sr)
+    elif not hollow:
+        mono = _hp1(mono, (40.0 + 12.0 * sh) * max(0.75, pitch_k * 0.9), sr)
     if hp_cut and hp_cut > 0:
         mono = _hp1(mono, float(hp_cut), sr)
 
     _ = (
-        wetness, antimetal, declick, roundness, attack_ms, predelay_ms,
+        antimetal, declick, roundness, attack_ms, predelay_ms,
         plop_db, slap_db, splat_db, splash_db, spray_db, spray_tail_ms,
         diffuse_g, force_full,
     )
