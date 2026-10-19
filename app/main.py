@@ -699,7 +699,7 @@ class Main(QtWidgets.QMainWindow):
         dens0 = float(self.room.droplet_density)
         self.lbl_rain = QtWidgets.QLabel(self._sharpness_label(self.room.rain_intensity))
         self.lbl_density = QtWidgets.QLabel(self._quantity_label(dens0))
-        self.sld_density.setToolTip(self._quantity_label(dens0))
+        self.sld_density.setToolTip(self._quantity_tooltip(dens0))
         form.addRow("Sharpness", _slider_row(self.sld_rain, self.lbl_rain))
         form.addRow("Quantity", _slider_row(self.sld_density, self.lbl_density))
 
@@ -2119,21 +2119,21 @@ class Main(QtWidgets.QMainWindow):
 
     @staticmethod
     def _quantity_label(q: float, wind: float = 0.0) -> str:
+        from app.audio.rain_dsd import quantity_to_rain_rate, rain_rate_class
+
         q = max(0.0, min(1.0, float(q)))
         if q <= 0.0005:
             return "0%  ·  off"
-        if q < 0.12:
-            tag = "drizzle"
-        elif q < 0.35:
-            tag = "light rain"
-        elif q < 0.60:
-            tag = "steady rain"
-        elif q < 0.85:
-            tag = "heavy rain"
-        else:
-            tag = "downpour"
+        tag = rain_rate_class(quantity_to_rain_rate(q))
         # Keep this short — a long label collapses the slider in the inspector.
         return f"{int(q * 100)}%  ·  {tag}"
+
+    @staticmethod
+    def _quantity_tooltip(q: float) -> str:
+        from app.audio.rain_dsd import describe
+
+        q = max(0.0, min(1.0, float(q)))
+        return f"{int(q * 100)}%  ·  {describe(q)}"
 
     @staticmethod
     def _volume_label(v: float) -> str:
@@ -2155,7 +2155,7 @@ class Main(QtWidgets.QMainWindow):
         self.room.droplet_density = v / 100.0
         q = self.room.droplet_density
         self.lbl_density.setText(self._quantity_label(q))
-        self.sld_density.setToolTip(self._quantity_label(q))
+        self.sld_density.setToolTip(self._quantity_tooltip(q))
 
     def _on_mix_master(self, v: int):
         """Master 0..100 → 0..1; keep Simulate volume slider in sync."""

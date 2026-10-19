@@ -273,6 +273,13 @@ class DropSampleBank:
         # Copy so callers can scale in place without mutating bank
         return np.array(variants[idx], copy=True)
 
+    def variants(self, surface: str, size_mm: float, sharpness: float) -> List[np.ndarray]:
+        """Every stored single-hit variant for the nearest bank entry (copies)."""
+        self.ensure_built()
+        key = (_norm_surface(surface), _nearest(SIZE_BINS_MM, float(size_mm)),
+               _nearest(SHARP_BINS, float(sharpness)), 1)
+        return [np.array(g, copy=True) for g in self._grains.get(key, [])]
+
     def stats(self) -> dict:
         return {
             "ready": self._built,

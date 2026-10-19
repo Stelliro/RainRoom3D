@@ -34,10 +34,12 @@ try:
 except Exception:  # pragma: no cover
     sd = None
 
-from app.audio.drop_bank import DropSampleBank
+from app.audio.drop_bank import SHARP_BINS, SIZE_BINS_MM, DropSampleBank, _nearest
 from app.audio.engine import synth_drop, _db, _peak_cap
 from app.audio.field_bed import OutdoorFieldBed
 from app.audio.field_router import OutdoorFieldRouter
+from app.audio.rain_dsd import D_MAX_MM, D_MIN_MM, DropSizeDist, dsd_for_quantity, impact_amp, loudness_gain
+from app.audio.rain_texture import VARIANTS_PER_SIZE, DenseRainTexture, make_variants
 from app.audio.reverb import MonoRoomReverb, StereoRoomReverb, room_reverb_from_layout
 from app.audio.spatial import (
     C_SOUND,
@@ -65,6 +67,15 @@ _MAX_VOICE_EVENTS_PER_SEC = 170.0
 _MAX_SPAWN_PER_BLOCK = 36
 _DEFAULT_MAX_VOICES = 300
 _MAX_STEREO_VOICES = 180
+# Dense-texture sources → visual hit kind (3 roof, 2 window, 1 yard)
+_DENSE_SOURCES = {"roof": 3, "near": 2, "yard": 1}
+# Biggest drops/s that get their own spatial voice; the rest are dense texture.
+_DISCRETE_BUDGET_PER_SEC = 150.0
+# Calibrates physical impact_amp (1.0 = 3 mm drop) to the engine's mix level.
+_DROP_LEVEL = 0.55
+# The portal render (no 3D view) couples ~3 dB hotter than the cheap taps
+# the 3D view uses; trim it so switching tabs doesn't jump the volume.
+_EVENT_PATH_TRIM = 0.65
 
 
 def _soft_clip(sig: np.ndarray, ceiling: float = 0.88) -> np.ndarray:
@@ -657,6 +668,16 @@ class SpatialRainEngine:
         self._include_you = False
         self._hp_queue = None
         self._last_wall: Dict[str, np.ndarray] = {}
+        # Dense texture: drops below the discrete split (see rain_texture.py)
+        self.use_dense_texture = True
+        self._dense = DenseRainTexture(sr=self.samplerate, n_stems=3, seed=777)
+        self._dense_kernel_id: Optional[tuple] = None
+        self._dense_kernel_gain: Dict[str, float] = {}
+        self._dense_cal: Optional[Dict[str, Dict[object, float]]] = None
+        self._dense_cal_fp: Optional[tuple] = None
+        self._dense_cal_t = -1e9
+        self._visual_active = False
+        self._visual_rate = 0.0
 
     # ----- devices -----
     @property
@@ -760,37 +781,53 @@ class SpatialRainEngine:
         self._wind_speed_eff += max(-slew_s * dt, min(slew_s * dt, ds))
         self._wind_speed_eff = max(0.0, min(1.0, self._wind_speed_eff))
 
-    def _ips(self) -> float:
-        """*Perceived* discrete droplet impacts per second (Quantity).
+    def _rain_area(self) -> float:
+        """Catchment that can be heard: roof plus a ~0.85 m eaves/yard ring."""
+        rw = max(0.5, float(self.room.width))
+        rd = max(0.5, float(self.room.depth))
+        ring = 0.85
+        return rw * rd + 2.0 * ring * (rw + rd) + 4.0 * ring * ring
 
-        This is how dense the rain *feels*. Actual spatialized voices are
-        lower — see ``_chain_hits`` / ``_voice_ips`` (multi-hit chains).
+    def _discrete_budget(self) -> float:
+        """Voiced drops/s. With the 3D view driving, never more than it lands."""
+        if self._visual_active and self._visual_rate > 0.0:
+            return max(1.0, min(_DISCRETE_BUDGET_PER_SEC, self._visual_rate))
+        return _DISCRETE_BUDGET_PER_SEC
+
+    def _rain_state(self) -> Tuple[float, Optional[DropSizeDist], float]:
+        """(drops/s on the house with D >= split, distribution, split mm).
+
+        Drops above ``split`` get their own spatial voice (budget-capped);
+        the rest are the dense texture. Wind tilts more rain into the facades.
         """
-        quantity = float(getattr(self.room, "droplet_density", 0.5))
-        sh = self._sharpness()
-        wabs = self._wind_speed()
-        if quantity <= 0.0005:
-            return 0.0
-        q = max(0.0, min(1.0, quantity))
-        # Fallback when OpenGL isn't driving hits (floor-plan / headphones-only).
-        # q=0.08 → ~14, q=0.22 → ~40, q=1 → ~160
-        soft_boost = 1.04 - 0.06 * sh
-        body = 148.0 * (q ** 1.05)
-        floor = 9.0 + 4.0 * q
-        wind_boost = 1.0 + 0.10 * wabs
-        return float(min(_MAX_VOICE_EVENTS_PER_SEC, (floor + body) * soft_boost * wind_boost))
+        q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
+        rate, dist = dsd_for_quantity(q)
+        if rate <= 0.0:
+            return 0.0, None, D_MAX_MM
+        area = self._rain_area() * (1.0 + 0.10 * self._wind_speed())
+        split = dist.split_for_rate(self._discrete_budget(), area)
+        return float(dist.flux(split) * area), dist, float(split)
+
+    def _ips(self) -> float:
+        """Discrete (individually spatialized) drop impacts per second.
+
+        Physical: the largest drops landing on the house, up to the voice
+        budget. Everything smaller is the dense texture (``_mix_dense``).
+        """
+        n, _dist, _split = self._rain_state()
+        return float(min(_MAX_VOICE_EVENTS_PER_SEC, n))
 
     def _chain_hits(self) -> int:
-        """1 = single drop. 2 = tight double-tap at downpour only."""
-        q = max(0.0, min(1.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0)))
-        return 2 if q >= 0.78 else 1
+        """Always single drops — density now comes from the dense texture."""
+        return 1
 
     def _voice_ips(self) -> float:
-        perc = self._ips()
-        if perc <= 0.0:
-            return 0.0
-        ch = float(self._chain_hits())
-        return float(min(_MAX_VOICE_EVENTS_PER_SEC, max(6.0, perc / ch)))
+        return self._ips()
+
+    def _drop_amp(self, d_mm: float) -> float:
+        """Physical per-drop amplitude (shared by discrete and dense paths)."""
+        q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
+        return float(impact_amp(d_mm)) * loudness_gain(q) * _DROP_LEVEL
 
     def _droplet_playback_rate(self, quantity: float) -> float:
         """Subtle speed-up of each droplet grain as quantity rises.
@@ -825,6 +862,22 @@ class SpatialRainEngine:
         t -= pw
         return -d, 0.02, float(rd + d - t), d, "west"
 
+    def _layer_probs(self) -> Dict[str, float]:
+        """Share of landings per layer (roof / wall / near-window / yard)."""
+        r = self.room
+        q_amt = max(0.0, min(1.0, float(getattr(r, "droplet_density", 0.5) or 0.0)))
+        roof_mat = str(getattr(r, "roof_material", "") or "").lower()
+        tin = ("tin" in roof_mat) or ("metal" in roof_mat)
+        p_roof = (0.82 + 0.06 * q_amt) if tin else (0.70 + 0.08 * q_amt)
+        p_wall = 0.06
+        p_near = 0.08 if (getattr(r, "windows", None) or []) else 0.0
+        return {
+            "roof": p_roof,
+            "wall": p_wall,
+            "near": p_near,
+            "yard": max(0.0, 1.0 - p_roof - p_wall - p_near),
+        }
+
     def _pick_source_3d(self) -> Tuple[str, float, float, float, float]:
         """Outdoor impacts on the room footprint plus a thin eaves ring.
 
@@ -833,6 +886,21 @@ class SpatialRainEngine:
 
         Returns (layer, x, y, z, depth_m_from_house).
         """
+        p = self._layer_probs()
+        u = float(self._rng.rand())
+        t_wall = p["roof"] + p["wall"]
+        t_near = t_wall + p["near"]
+        if u < p["roof"]:
+            layer = "roof"
+        elif u < t_wall:
+            layer = "wall"
+        elif p["near"] > 0.0 and u < t_near:
+            layer = "near"
+        else:
+            layer = "yard"
+        return self._point_for_layer(layer)
+
+    def _point_for_layer(self, layer: str) -> Tuple[str, float, float, float, float]:
         r = self.room
         rng = self._rng
         wx, wz = self._wind_push()
@@ -840,12 +908,6 @@ class SpatialRainEngine:
         rw = max(0.5, float(r.width))
         rd = max(0.5, float(r.depth))
         rh = max(1.5, float(r.height))
-        q_amt = max(0.0, min(1.0, float(getattr(r, "droplet_density", 0.5) or 0.0)))
-        roof_mat = str(getattr(r, "roof_material", "") or "").lower()
-        tin = ("tin" in roof_mat) or ("metal" in roof_mat)
-        p_roof = (0.82 + 0.06 * q_amt) if tin else (0.70 + 0.08 * q_amt)
-        p_wall = 0.06
-        p_near = 0.08 if windows else 0.0
 
         def _along_window(win, out_dist: float):
             wall = (getattr(win, "wall", "north") or "north").lower()
@@ -861,21 +923,17 @@ class SpatialRainEngine:
                 return cx + out_dist, y, cz + lat
             return cx - out_dist, y, cz + lat
 
-        u = float(rng.rand())
-        t_wall = p_roof + p_wall
-        t_near = t_wall + p_near
-        if u < p_roof:
-            layer = "roof"
+        if layer == "near" and not windows:
+            layer = "yard"
+        if layer == "roof":
             x = float(rng.uniform(0.05, max(0.15, rw - 0.05)))
             z = float(rng.uniform(0.05, max(0.15, rd - 0.05)))
             y = rh + 0.03
             depth = 0.0
-        elif u < t_wall:
-            layer = "wall"
+        elif layer == "wall":
             x, _y, z, depth, _w = self._ring_point(float(rng.uniform(0.05, 0.45)))
             y = float(rng.uniform(0.15, rh * 0.92))
-        elif windows and u < t_near:
-            layer = "near"
+        elif layer == "near":
             weights = np.array(
                 [max(0.05, float(getattr(w, "open", 0.7))) for w in windows],
                 dtype=np.float64,
@@ -979,6 +1037,22 @@ class SpatialRainEngine:
         if self._voices:
             self._voices.popleft()
 
+    def _grain_rate_jitter(self) -> float:
+        """Per-hit playback rate. The bank holds 3 variants per key; at a
+        downpour the same ones repeat and their noise peaks line up into a
+        hollow ring. Small random rates keep every hit's spectrum different."""
+        return math.exp(float(self._rng.uniform(-0.09, 0.09)))
+
+    def _jitter_grain(self, mono: np.ndarray) -> np.ndarray:
+        rate = self._grain_rate_jitter()
+        if len(mono) <= 32:
+            return mono
+        n_out = max(24, int(round(len(mono) / rate)))
+        xq = np.linspace(0.0, len(mono) - 1, n_out)
+        out = np.interp(xq, np.arange(len(mono), dtype=np.float64), mono)
+        # Level-neutral: pitch varies, loudness stays on the drop-size law
+        return out * math.sqrt(float(np.sum(mono * mono)) / max(1e-18, float(np.sum(out * out))))
+
     def _short_grain(
         self, mono: np.ndarray, ms: float = 42.0, fade_ms: float = 8.0
     ) -> np.ndarray:
@@ -1045,8 +1119,9 @@ class SpatialRainEngine:
             taps.append((i, sig, 0))
         return taps
 
-    def _spawn_visual_hit(self, hit: Tuple[float, float, float, int]) -> None:
-        """One OpenGL droplet landing → its own stacked grain."""
+    def _spawn_visual_hit(self, hit: Tuple[float, float, float, int], delay_n: int = 0) -> None:
+        """One OpenGL droplet landing → its own stacked grain, ``delay_n``
+        samples into the next block."""
         try:
             sx, sy, sz, kind = float(hit[0]), float(hit[1]), float(hit[2]), int(hit[3])
         except Exception:
@@ -1054,6 +1129,12 @@ class SpatialRainEngine:
         q = max(0.0, min(1.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0)))
         if q <= 0.0005:
             return
+        # The view lands thousands of streaks/s at downpour; only the biggest
+        # drops are voiced. The rest are already in the dense texture.
+        if self._visual_rate > 0.0:
+            keep = self._discrete_budget() / self._visual_rate
+            if keep < 1.0 and float(self._rng.rand()) > keep:
+                return
         if kind == 3:
             surface = self._surface_for_layer("roof")
         elif kind == 2:
@@ -1061,19 +1142,19 @@ class SpatialRainEngine:
         else:
             surface = self._surface_for_layer("yard")
         sharp = self._sharpness()
-        size = 1.3 + 2.4 * q + float(self._rng.uniform(-0.35, 0.45))
-        if kind == 3:
-            size *= 1.12
+        # A drawn droplet stands for one of the big drops; the dense texture
+        # carries the ones too small / many to draw.
+        _n, dist, split = self._rain_state()
+        drop_d = float(dist.sample(1, self._rng, split, D_MAX_MM)[0]) if dist is not None else 2.0
+        size = drop_d * (1.12 if kind == 3 else 1.0)
         mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
         amp = (
-            float(self._rng.uniform(0.70, 1.08))
+            self._drop_amp(drop_d)
+            * math.exp(float(self._rng.normal(0.0, 0.25)))
             * self._master
-            * (0.62 + 0.55 * q)
             * (mix_d ** 0.85)
             * (0.70 + 0.22 * sharp)
         )
-        nv = max(1, len(self._voices))
-        amp *= 1.0 / (0.86 + 0.024 * math.sqrt(nv))
         # Stay on the user's sharpness bin. Forcing 0.88 at downpour made plastic clacks.
         hit_sharp = max(0.12, min(0.95, sharp + 0.06 * q))
         try:
@@ -1096,6 +1177,7 @@ class SpatialRainEngine:
                 tone_ring=0.0 if surface == "metal" else None,
             )
         self._evt_id += 1
+        mono = self._jitter_grain(mono)
         if surface == "metal":
             # Slightly shorter at downpour so new attacks aren't buried in tails.
             grain_ms = 52.0 - 8.0 * q
@@ -1107,7 +1189,10 @@ class SpatialRainEngine:
             mono = self._short_grain(mono, ms=grain_ms, fade_ms=8.0) * amp
         src = (sx, sy, sz)
         taps = self._cheap_taps_for_hit(mono, src, kind)
+        delay_n = max(0, int(delay_n))
         if taps:
+            if delay_n:
+                taps = [(ch, np.concatenate([np.zeros(delay_n), buf[pos:]]), 0) for ch, buf, pos in taps]
             if len(self._voices) >= self.max_voices:
                 self._evict_voice()
             self._voices.append(_TapVoice(taps, kind=kind))
@@ -1124,7 +1209,35 @@ class SpatialRainEngine:
             g *= distance_attenuation(dist, ref=0.6, rolloff=1.1)
             stereo = binaural(mono * g * 1.35, az, el, distance=dist, sr=self.samplerate, quality="fast")
             if float(np.max(np.abs(stereo))) > 1e-7:
+                if delay_n:
+                    stereo = np.concatenate([np.zeros((delay_n, stereo.shape[1])), stereo])
                 self._stereo_voices.append(_StereoVoice(stereo))
+
+    def _event_layer_gain(self, layer: str, surface: str) -> float:
+        """Coupling of a landing layer into the room (non-visual path)."""
+        wabs = self._wind_speed()
+        sharp = self._sharpness()
+        g = 1.0
+        if surface in ("tarp", "shell", "plastic", "hollow"):
+            g *= 0.78
+        if layer == "far":
+            g *= 0.30
+        elif layer == "mid":
+            g *= 0.68
+        elif layer == "yard":
+            g *= 0.18 + 0.06 * wabs if surface != "metal" else 0.22
+        elif layer == "wall":
+            g *= 0.70 + 0.12 * wabs
+        elif layer == "roof":
+            g *= 1.40 + 0.18 * wabs if surface == "metal" else (0.85 + 0.12 * wabs)
+        elif layer == "canopy":
+            g *= 0.42 + 0.10 * wabs
+        elif layer == "near":
+            g *= 1.05 + 0.15 * wabs
+        g *= 0.65 + 0.25 * sharp
+        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
+        g *= 0.78 + 0.35 * wabs * (0.35 + 0.65 * min(1.5, mix_wind))
+        return float(g)
 
     def _spawn_event(self, schedule_delay_n: int = 0):
         """Spawn outdoor impact chain → couple indoors → speakers / ears."""
@@ -1135,18 +1248,15 @@ class SpatialRainEngine:
         q = float(getattr(self.room, "droplet_density", 0.5) or 0.5)
         chain_n = self._chain_hits()
 
-        # Size: sharpness + quantity → soft/light drizzle vs sharp/heavy hits
-        u = float(self._rng.rand())
-        power = 1.85 - 0.55 * sharp
-        t = u ** power
-        size_max = 2.2 + 2.8 * sharp
-        size = 0.45 + t * size_max
-        size *= 1.0 - 0.18 * q * (1.0 - 0.5 * sharp)
-        if q < 0.22:
-            # Drizzle hits need body or they vanish under the bed
-            size = max(size, 1.35 + 0.55 * (1.0 - q / 0.22))
+        # Physical size: the biggest drops (above the dense/discrete split)
+        _n, dist, split = self._rain_state()
+        if dist is None:
+            self._evt_id += 1
+            return
+        drop_d = float(dist.sample(1, self._rng, split, D_MAX_MM)[0])
+        # tone_weight only shifts the grain timbre, not the physical loudness
         twt = max(0.0, min(1.0, float(getattr(self.room, "tone_weight", 0.5) or 0.5)))
-        size *= 0.55 + 0.90 * twt
+        size = drop_d * (0.55 + 0.90 * twt)
         # Roof / wall impacts run a bit larger (mass of surface hit)
         if layer == "roof":
             size *= 1.12
@@ -1201,7 +1311,7 @@ class SpatialRainEngine:
         tp = max(0.0, min(1.0, float(getattr(self.room, "tone_pitch", 0.5) or 0.5)))
         # pitch 0 → slower/deeper (~0.88×), 1 → faster/higher (~1.12×)
         pitch_rate = 0.88 + 0.24 * tp
-        rate = self._droplet_playback_rate(q) * pitch_rate
+        rate = self._droplet_playback_rate(q) * pitch_rate * self._grain_rate_jitter()
         if abs(rate - 1.0) > 0.008 and len(mono) > 32:
             n_out = max(24, int(round(len(mono) / rate)))
             if n_out != len(mono):
@@ -1217,41 +1327,17 @@ class SpatialRainEngine:
             if q < 0.35 and len(mono) > fade_n * 2:
                 mono[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float64)
 
-        qq = max(0.02, min(1.0, q))
-        # Heavier rain = louder hits (was inverted: drizzle boosted, downpour cut)
-        dens_bal = 0.70 + 0.70 * qq
-        size_k = 0.55 + 0.50 * min(1.0, size / max(0.5, size_max))
         mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
-        mix_d_eff = mix_d ** (0.92 if qq > 0.4 else 0.78)
-        # Chains already pack energy — don't let long chains clip the bus
-        chain_k = 1.0 / (0.55 + 0.45 * math.sqrt(float(chain_n)))
+        chain_k = 1.0
+        # Heavy-tailed: drop size sets loudness (~25 dB from 1 mm to 3 mm)
         amp = (
-            float(self._rng.uniform(0.65, 1.05))
+            self._drop_amp(drop_d)
+            * math.exp(float(self._rng.normal(0.0, 0.25)))
             * self._master
-            * dens_bal
-            * size_k
-            * mix_d_eff
-            * chain_k
+            * (mix_d ** 0.85)
+            * _EVENT_PATH_TRIM
         )
-        if surface in ("tarp", "shell", "plastic", "hollow"):
-            amp *= 0.78
-        if layer == "far":
-            amp *= 0.30
-        elif layer == "mid":
-            amp *= 0.68
-        elif layer == "yard":
-            amp *= 0.18 + 0.06 * wabs if surface != "metal" else 0.22
-        elif layer == "wall":
-            amp *= 0.70 + 0.12 * wabs
-        elif layer == "roof":
-            amp *= 1.40 + 0.18 * wabs if surface == "metal" else (0.85 + 0.12 * wabs)
-        elif layer == "canopy":
-            amp *= 0.42 + 0.10 * wabs
-        elif layer == "near":
-            amp *= 1.05 + 0.15 * wabs
-        amp *= 0.65 + 0.25 * sharp
-        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
-        amp *= 0.78 + 0.35 * wabs * (0.35 + 0.65 * min(1.5, mix_wind))
+        amp *= self._event_layer_gain(layer, surface)
         mono = mono * amp
         self._evt_id += 1
         src = (x, y, z)
@@ -1336,6 +1422,192 @@ class SpatialRainEngine:
                     stereo = stereo.copy()
                     stereo[:n0] *= np.linspace(0.0, 1.0, n0, dtype=np.float64)[:, None]
                 self._stereo_voices.append(_StereoVoice(stereo))
+
+    # ----- dense texture (drops below the discrete split) -----
+    def _dense_surface(self, source: str) -> str:
+        if source == "roof":
+            return self._surface_for_layer("roof")
+        if source == "near":
+            return "glass"
+        return "water"
+
+    def _dense_kernel_key(self) -> tuple:
+        q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
+        hit_sharp = max(0.12, min(0.95, self._sharpness() + 0.06 * q))
+        return (
+            self._dense_surface("roof"),
+            _nearest(SHARP_BINS, hit_sharp),
+            int(round(q * 10)),
+        )
+
+    def _ensure_dense_kernels(self) -> None:
+        """Bank grains shaped exactly like a visual landing (see _spawn_visual_hit)."""
+        key = self._dense_kernel_key()
+        if key == self._dense_kernel_id:
+            return
+        self._drop_bank.ensure_built()
+        _roof, sharp, q10 = key
+        q = q10 / 10.0
+        vrng = np.random.RandomState(4111)
+        for source in _DENSE_SOURCES:
+            surface = self._dense_surface(source)
+            grains = []
+            for size in SIZE_BINS_MM:
+                bank = self._drop_bank.variants(surface, size, sharp) or [
+                    self._drop_bank.pick(surface=surface, size_mm=size, sharpness=sharp, chain_n=1)
+                ]
+                for g in make_variants(bank, VARIANTS_PER_SIZE, vrng):
+                    if surface == "metal":
+                        g = self._short_grain(g, ms=52.0 - 8.0 * q, fade_ms=4.0) * (1.18 + 0.22 * q)
+                    else:
+                        g = self._short_grain(g, ms=26.0 + 4.0 * q, fade_ms=8.0) * 0.32
+                    grains.append(g)
+            self._dense.set_kernels(source, SIZE_BINS_MM, grains)
+            self._dense_kernel_gain[source] = 1.18 + 0.22 * q if surface == "metal" else 0.32
+        self._dense_kernel_id = key
+        self._dense_cal_fp = None  # grains changed → recalibrate
+
+    def _dense_fingerprint(self, visual: bool) -> tuple:
+        r = self.room
+        L = r.listener
+        spk = tuple(
+            (round(float(s.x), 2), round(float(s.y), 2), round(float(s.z), 2),
+             bool(getattr(s, "enabled", True)), round(float(getattr(s, "gain_db", 0.0) or 0.0), 1))
+            for s in r.speakers
+        )
+        wins = tuple(
+            (str(getattr(w, "wall", "")), round(float(getattr(w, "offset", 0.0) or 0.0), 2),
+             round(float(getattr(w, "open", 0.0) or 0.0), 2))
+            for w in (getattr(r, "windows", []) or [])
+        )
+        return (
+            bool(visual), self._dense_kernel_id,
+            round(float(r.width), 2), round(float(r.depth), 2), round(float(r.height), 2),
+            str(getattr(r, "roof_material", "")), str(getattr(r, "wall_material", "")),
+            round(float(L.x), 2), round(float(getattr(L, "y", 1.2)), 2), round(float(L.z), 2),
+            round(float(getattr(L, "yaw", 0.0)), 2), spk, wins, self.render_listener_binaural,
+        )
+
+    def _calibrate_dense(self, visual: bool) -> None:
+        """Measure each layer's average path gain to every speaker and ear.
+
+        Runs the same coupling the discrete voices use (cheap taps for visual
+        landings, full portal render otherwise) on a probe grain at a handful
+        of landing spots, so the dense sheet sits level with discrete drops.
+        """
+        sr = self.samplerate
+        main_rng = self._rng
+        self._rng = np.random.RandomState(9173)
+        cal: Dict[str, Dict[object, float]] = {}
+        try:
+            L = self.room.listener
+            lis = ((float(L.x), float(getattr(L, "y", 1.2)), float(L.z)), float(getattr(L, "yaw", 0.0)))
+            recvs = [
+                (i, (float(sp.x), float(sp.y), float(sp.z)), _db(float(getattr(sp, "gain_db", 0.0) or 0.0)))
+                for i, sp in enumerate(self.room.speakers)
+                if getattr(sp, "enabled", True)
+            ]
+            for source, kind in _DENSE_SOURCES.items():
+                _sizes, grains = self._dense._kernels[source]
+                probe = np.asarray(grains[VARIANTS_PER_SIZE], dtype=np.float64) / max(1e-9, self._dense_kernel_gain[source])
+                e_in = float(np.sum(probe * probe)) + 1e-18
+                acc: Dict[object, float] = {}
+                n_pts = 8
+                for _ in range(n_pts):
+                    _layer, sx, sy, sz, _d = self._point_for_layer(source)
+                    st = None
+                    if visual:
+                        for i, sig, _p in self._cheap_taps_for_hit(probe, (sx, sy, sz), kind):
+                            acc[i] = acc.get(i, 0.0) + float(np.sum(sig * sig))
+                        if self.render_listener_binaural:
+                            dx, dy, dz = sx - lis[0][0], sy - lis[0][1], sz - lis[0][2]
+                            dist = max(0.25, math.sqrt(dx * dx + dy * dy + dz * dz))
+                            g = self._portal_gain_cheap(sx, sy, sz, kind)
+                            g *= distance_attenuation(dist, ref=0.6, rolloff=1.1)
+                            st = binaural(probe * g * 1.35, math.atan2(dx, dz) - lis[1],
+                                          math.asin(max(-1.0, min(1.0, dy / dist))),
+                                          distance=dist, sr=sr, quality="fast")
+                    else:
+                        spk_bufs, st, _portals = render_drop_to_receivers(
+                            self.room, probe, (sx, sy, sz), recvs, sr,
+                            listener=lis if self.render_listener_binaural else None,
+                            fast=True, binaural_quality="fast",
+                        )
+                        for i, sig in spk_bufs.items():
+                            acc[i] = acc.get(i, 0.0) + float(np.sum(sig * sig))
+                        if st is not None:
+                            st = st * 1.55
+                    if st is not None and st.size:
+                        acc["L"] = acc.get("L", 0.0) + float(np.sum(st[:, 0] ** 2))
+                        acc["R"] = acc.get("R", 0.0) + float(np.sum(st[:, 1] ** 2))
+                cal[source] = {k: math.sqrt(v / (n_pts * e_in)) for k, v in acc.items()}
+        except Exception:
+            log.exception("dense texture calibration failed")
+            cal = {}
+        finally:
+            self._rng = main_rng
+        self._dense_cal = cal
+
+    def _mix_dense(self, frames: int, mix: Dict[int, np.ndarray], visual: bool) -> None:
+        """Add the dense drop texture to speakers, roof bus and the ears."""
+        if not self.use_dense_texture or frames <= 0:
+            return
+        q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
+        _n, dist, split = self._rain_state()
+        plan = {}
+        if dist is not None and split > D_MIN_MM:
+            self._ensure_dense_kernels()
+            fp = self._dense_fingerprint(visual)
+            stale = fp != self._dense_cal_fp and (self._time - self._dense_cal_t) > 0.5
+            if stale or self._dense_cal is None:
+                self._calibrate_dense(visual)
+                self._dense_cal_fp = fp
+                self._dense_cal_t = self._time
+            mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
+            sharp = self._sharpness()
+            # Drizzle: keep the sheet ~6 dB under the ticks; physical by moderate rain.
+            trim = 10.0 ** (-6.0 * (1.0 - min(1.0, q / 0.5)) / 20.0)
+            base = loudness_gain(q) * _DROP_LEVEL * self._master * (mix_d ** 0.85) * trim
+            total = dist.flux(D_MIN_MM, split) * self._rain_area() * (1.0 + 0.10 * self._wind_speed())
+            probs = self._layer_probs()
+            share = {"roof": probs["roof"], "near": probs["near"], "yard": probs["yard"] + probs["wall"]}
+            for source in _DENSE_SOURCES:
+                rate = total * share[source]
+                if rate <= 0.0:
+                    continue
+                if visual:
+                    k = base * (0.70 + 0.22 * sharp)
+                else:
+                    surface = self._dense_surface(source)
+                    k = (
+                        base * _EVENT_PATH_TRIM * self._event_layer_gain(source, surface)
+                        / self._dense_kernel_gain[source]
+                    )
+                plan[source] = (rate, dist, D_MIN_MM, split, k)
+        n_on = sum(1 for sp in self.room.speakers if getattr(sp, "enabled", True))
+        self._dense.set_stems(min(4, max(2, n_on)))
+        stems = self._dense.render(frames, plan)
+        if not stems:
+            return
+        cal = self._dense_cal or {}
+        n_st = self._dense.n_stems
+        for source, st in stems.items():
+            gains = cal.get(source, {})
+            for i, sp in enumerate(self.room.speakers):
+                g = gains.get(i, 0.0)
+                if g <= 0.0 or not getattr(sp, "enabled", True):
+                    continue
+                buf = st[i % n_st] * g
+                mix[i] = mix[i] + buf if i in mix else buf
+            if source == "roof" and not visual:
+                rid = WALL_BUS["roof"]
+                rb = st[0] * 0.144
+                mix[rid] = mix[rid] + rb if rid in mix else rb
+            if self._last_binaural is not None and self._last_binaural.shape[0] == frames:
+                gl, gr = gains.get("L", 0.0), gains.get("R", 0.0)
+                if gl > 0.0 or gr > 0.0:
+                    self._last_binaural[:, 0] += st[0] * gl
+                    self._last_binaural[:, 1] += st[1 % n_st] * gr
 
     def _mix_speakers(self, frames: int) -> Dict[int, np.ndarray]:
         n_spk = max(1, len(self.room.speakers))
@@ -1512,9 +1784,20 @@ class SpatialRainEngine:
             vis_hits = self._pending_hits
             self._pending_hits = []
             visual = (now - self._visual_seen_t) < 0.28
+        self._visual_active = visual
         if visual:
+            # ~1 s smoothing of how many drawn drops land per second
+            inst = len(vis_hits) / max(1e-6, dt)
+            a = min(1.0, dt / 1.0)
+            self._visual_rate = inst if self._visual_rate <= 0.0 else self._visual_rate + a * (inst - self._visual_rate)
+        else:
+            self._visual_rate = 0.0
+        if visual:
+            # The view hands over a block's landings at once. Starting them all
+            # on sample 0 put the loudest drops on a 23 Hz grid (a drum roll);
+            # spread them across the block like the Poisson scheduler does.
             for h in vis_hits:
-                self._spawn_visual_hit(h)
+                self._spawn_visual_hit(h, delay_n=int(self._rng.randint(0, frames)))
             self._next_event = t1
         else:
             vips = self._voice_ips()
@@ -1537,6 +1820,9 @@ class SpatialRainEngine:
         mix = self._mix_speakers(frames)
         # Stash binaural block for headphone path
         self._last_binaural = self._mix_binaural(frames)
+
+        # Drops too many to voice one by one: shot-noise sheet of the same grains
+        self._mix_dense(frames, mix, visual)
 
         # Continuous outdoor field through portals (procedural ± WAV samples)
         self._mix_outdoor_field(frames, mix)
@@ -1608,6 +1894,8 @@ class SpatialRainEngine:
         self._evt_id = 0
         self._rng = np.random.RandomState(seed)
         self._wind_air = WindAirSynth(sr=self.samplerate, seed=4242 + seed)
+        self._dense.reset(777 + seed)
+        self._dense_cal_t = -1e9
         self._field = OutdoorFieldBed(sr=self.samplerate, seed=2024 + seed)
         self._field_router = OutdoorFieldRouter(sr=self.samplerate)
         self._reverb_mono = {}

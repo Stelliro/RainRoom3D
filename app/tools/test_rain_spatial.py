@@ -545,6 +545,135 @@ def test_downpour_visual_stacks_ticks() -> bool:
     )
 
 
+def _binaural_block(eng, room, q: float, seconds: float = 3.0, seed: int = 42) -> np.ndarray:
+    room.droplet_density = q
+    eng._reset_sim(seed)
+    frames = int(eng.blocksize)
+    parts = []
+    for _ in range(max(1, int(seconds * eng.samplerate / frames))):
+        eng._advance(frames)
+        parts.append(eng._last_binaural.mean(axis=1))
+    return np.concatenate(parts)[eng.samplerate // 2 :]
+
+
+def test_quantity_keeps_rising() -> bool:
+    """Every slider step gets louder — no plateau past ~35% (old AGC bug)."""
+    from pathlib import Path
+
+    from app.audio.spatial_engine import SpatialRainEngine
+    from app.models.room import default_house
+    from app.utils.persistence import load_room
+
+    p = Path("configs/my_house.json")
+    room = load_room(str(p)) if p.is_file() else default_house()
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    qs = (0.05, 0.35, 0.6, 0.8, 1.0)
+    lv = []
+    for q in qs:
+        x = _binaural_block(eng, room, q)
+        lv.append(20.0 * math.log10(float(np.sqrt(np.mean(x * x))) + 1e-12))
+    steps = [b - a for a, b in zip(lv, lv[1:])]
+    ok = all(s >= 1.5 for s in steps) and (lv[-1] - lv[0]) >= 15.0
+    return _ok(
+        "quantity keeps getting louder to 100% (no plateau)",
+        ok,
+        "dB=" + "/".join(f"{v:.1f}" for v in lv) + " steps=" + "/".join(f"{s:.1f}" for s in steps),
+    )
+
+
+def test_downpour_sheet_not_hiss() -> bool:
+    """Dense texture at 100%: 10 ms envelope still moves (ticks), not flat noise."""
+    from app.audio.spatial_engine import SpatialRainEngine
+    from app.models.room import default_house
+
+    room = default_house()
+    room.roof_material = "Tin Roof"
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    x = _binaural_block(eng, room, 1.0)
+    win = 480
+    env = np.sqrt(np.mean(x[: len(x) // win * win].reshape(-1, win) ** 2, axis=1)) + 1e-12
+    spread = 20.0 * math.log10(float(np.percentile(env, 99) / np.percentile(env, 50)))
+    crest = 20.0 * math.log10(float(np.max(np.abs(x)) / np.sqrt(np.mean(x * x))))
+    _n, _dist, split = eng._rain_state()
+    ok = spread >= 4.0 and crest >= 10.0 and split > 3.0
+    return _ok(
+        "downpour is a sheet of ticks (envelope moves), not hiss",
+        ok,
+        f"env p99/p50={spread:.1f}dB crest={crest:.1f}dB split={split:.2f}mm",
+    )
+
+
+def _peak_prominence_db(x: np.ndarray, sr: int, lo: float = 150.0, hi: float = 5000.0) -> float:
+    """Tallest 1/12-octave band above its ±1/4-octave neighbourhood."""
+    n = 8192
+    seg = x[: len(x) // n * n].reshape(-1, n) * np.hanning(n)
+    P = np.mean(np.abs(np.fft.rfft(seg, axis=1)) ** 2, axis=0)
+    f = np.fft.rfftfreq(n, 1.0 / sr)
+    cents = lo * 2.0 ** np.arange(0.0, math.log2(hi / lo), 1.0 / 12.0)
+    band = np.array([P[(f >= c / 2 ** (1 / 24)) & (f < c * 2 ** (1 / 24))].mean() for c in cents])
+    band = 10.0 * np.log10(band + 1e-30)
+    prom = band - np.convolve(band, np.ones(7) / 7.0, mode="same")
+    return float(np.max(prom[3:-3]))
+
+
+def test_downpour_no_fixed_resonance() -> bool:
+    """A downpour sheet must not ring at fixed pitches (the "hollow bucket").
+
+    Thousands of copies/s of one grain reproduce that grain's noise peaks as
+    a steady resonance; grain variants + per-hit pitch spread average them out.
+    """
+    from app.audio.spatial_engine import SpatialRainEngine
+    from app.models.room import default_house
+
+    room = default_house()
+    room.roof_material = "Tin Roof"
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    x = _binaural_block(eng, room, 1.0, seconds=6.0)
+    prom = _peak_prominence_db(x, eng.samplerate)
+    return _ok(
+        "downpour has no fixed resonance (no hollow-bucket ring)",
+        prom <= 3.2,
+        f"tallest 1/12-oct peak={prom:.1f}dB (single-grain sheet ≈ 4–7 dB)",
+    )
+
+
+def test_visual_hits_not_on_block_grid() -> bool:
+    """Landings handed over per audio block must not all start on sample 0.
+
+    That put the loudest drops on a 23 Hz grid — a drum roll on a bucket.
+    """
+    from app.audio.spatial_engine import SpatialRainEngine
+    from app.models.room import default_house
+
+    room = default_house()
+    room.roof_material = "Tin Roof"
+    room.droplet_density = 0.15
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    eng.use_dense_texture = False
+    eng._reset_sim(7)
+    rng = np.random.RandomState(3)
+    frames = int(eng.blocksize)
+    parts = []
+    for _ in range(int(6 * eng.samplerate / frames)):
+        hits = [(rng.uniform(0, room.width), room.height + 0.02, rng.uniform(0, room.depth), 3)
+                for _ in range(rng.poisson(6))]
+        eng.submit_visual_impacts(hits)
+        eng._advance(frames)
+        parts.append(eng._last_binaural.mean(axis=1))
+    m = np.stack(parts[12:])
+    prof = np.mean(m.reshape(m.shape[0], 16, frames // 16) ** 2, axis=(0, 2))
+    swing = 10.0 * math.log10(float(prof.max() / prof.min()))
+    return _ok(
+        "visual landings spread across the block (no 23 Hz drum roll)",
+        swing <= 3.0,
+        f"energy swing across block phase={swing:.1f}dB",
+    )
+
+
 def main() -> int:
     print("RainRoom3D spatial / rain distribution checks")
     results = [
@@ -562,6 +691,10 @@ def main() -> int:
         test_drizzle_is_audible(),
         test_energy_fuse_not_double(),
         test_speaker_test_pan(),
+        test_quantity_keeps_rising(),
+        test_downpour_sheet_not_hiss(),
+        test_downpour_no_fixed_resonance(),
+        test_visual_hits_not_on_block_grid(),
     ]
     passed = sum(1 for r in results if r)
     print(f"\n{passed}/{len(results)} passed")
