@@ -36,6 +36,7 @@ from app.models.room import (
     MIX_REVERB_RECOMMENDED,
     MIX_WASH_RECOMMENDED,
     MIX_WIND_RECOMMENDED,
+    MIX_DRIPS_RECOMMENDED,
     TONE_PITCH_RECOMMENDED,
     TONE_RING_RECOMMENDED,
     TONE_SOFT_RECOMMENDED,
@@ -942,6 +943,14 @@ class Main(QtWidgets.QMainWindow):
             f"Recommended {MIX_WIND_RECOMMENDED:.2f}×. Silent when wind is off.",
             lambda: float(getattr(self.room, "mix_wind", MIX_WIND_RECOMMENDED)),
         )
+        _mix_row(
+            "drips",
+            "Drips & gutters",
+            "Eaves dripping and gutters running off the roof. They keep going "
+            "for a minute after the rain stops. "
+            f"Recommended {MIX_DRIPS_RECOMMENDED:.2f}×. 0 = off.",
+            lambda: float(getattr(self.room, "mix_drips", MIX_DRIPS_RECOMMENDED)),
+        )
 
         lay.addWidget(_section("Save & share"))
         self.btn_mix_copy = QtWidgets.QPushButton("Copy mix config")
@@ -952,7 +961,8 @@ class Main(QtWidgets.QMainWindow):
         self.btn_mix_reset = QtWidgets.QPushButton("Reset to recommended")
         self.btn_mix_reset.setToolTip(
             f"Wash {MIX_WASH_RECOMMENDED:.2f}× · Droplets {MIX_DROPLETS_RECOMMENDED:.2f}× · "
-            f"Echo {MIX_REVERB_RECOMMENDED:.2f}× · Wind {MIX_WIND_RECOMMENDED:.2f}× "
+            f"Echo {MIX_REVERB_RECOMMENDED:.2f}× · Wind {MIX_WIND_RECOMMENDED:.2f}× · "
+            f"Drips {MIX_DRIPS_RECOMMENDED:.2f}× "
             "(master volume unchanged)"
         )
         self.btn_mix_save = QtWidgets.QPushButton("Save house…")
@@ -1231,6 +1241,9 @@ class Main(QtWidgets.QMainWindow):
         )
         self.sld_mix_wind.valueChanged.connect(
             lambda v: self._on_mix_fader("mix_wind", v, self.lbl_mix_wind)
+        )
+        self.sld_mix_drips.valueChanged.connect(
+            lambda v: self._on_mix_fader("mix_drips", v, self.lbl_mix_drips)
         )
         self.btn_mix_copy.clicked.connect(self._copy_mix_config)
         self.btn_mix_reset.clicked.connect(self._reset_mix_defaults)
@@ -2182,6 +2195,7 @@ class Main(QtWidgets.QMainWindow):
             ("mix_droplets", self.sld_mix_droplets, self.lbl_mix_droplets, MIX_DROPLETS_RECOMMENDED),
             ("mix_reverb", self.sld_mix_reverb, self.lbl_mix_reverb, MIX_REVERB_RECOMMENDED),
             ("mix_wind", self.sld_mix_wind, self.lbl_mix_wind, MIX_WIND_RECOMMENDED),
+            ("mix_drips", self.sld_mix_drips, self.lbl_mix_drips, MIX_DRIPS_RECOMMENDED),
         )
         for attr, sld, lbl, default in pairs:
             x = float(getattr(self.room, attr, default))
@@ -2206,6 +2220,7 @@ class Main(QtWidgets.QMainWindow):
                 float(getattr(self.room, "mix_reverb", MIX_REVERB_RECOMMENDED)), 3
             ),
             "wind": round(float(getattr(self.room, "mix_wind", MIX_WIND_RECOMMENDED)), 3),
+            "drips": round(float(getattr(self.room, "mix_drips", MIX_DRIPS_RECOMMENDED)), 3),
             "quantity": round(float(getattr(self.room, "droplet_density", 0.55)), 3),
             "sharpness": round(float(getattr(self.room, "rain_intensity", 0.35)), 3),
             "tone_pitch": round(float(getattr(self.room, "tone_pitch", TONE_PITCH_RECOMMENDED)), 3),
@@ -2232,6 +2247,7 @@ class Main(QtWidgets.QMainWindow):
         self.room.mix_droplets = MIX_DROPLETS_RECOMMENDED
         self.room.mix_reverb = MIX_REVERB_RECOMMENDED
         self.room.mix_wind = MIX_WIND_RECOMMENDED
+        self.room.mix_drips = MIX_DRIPS_RECOMMENDED
         self._sync_mix_sliders()
         self.statusBar().showMessage(
             f"Mix reset to recommended: wash {MIX_WASH_RECOMMENDED:.2f} · "

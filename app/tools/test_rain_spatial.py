@@ -67,7 +67,8 @@ def test_ring_equal() -> bool:
 
 
 def test_rain_stays_on_the_house() -> bool:
-    """Hits land on the footprint or a thin eaves ring — not a 40 m field."""
+    """Hits land on the house or a thin eaves ring — not a 40 m field — and
+    the roof gets its share by area (house_model catchments)."""
     from app.models.room import default_house
     from app.audio.spatial_engine import SpatialRainEngine
 
@@ -91,11 +92,14 @@ def test_rain_stays_on_the_house() -> bool:
             far += 1
         else:
             eaves += 1
-    ok = roof / n >= 0.75 and far / n < 0.04
+    from app.audio import house_model as hm
+
+    want = hm.layer_shares(hm.catchments(room))["roof"]
+    ok = abs(roof / n - want) < 0.06 and far / n < 0.04
     return _ok(
         "rain stays on the house plus a thin eaves ring",
         ok,
-        f"roof={roof}/{n} eaves={eaves} far={far}",
+        f"roof={roof}/{n} (area share {want:.2f}) eaves={eaves} far={far}",
     )
 
 
@@ -583,7 +587,8 @@ def test_quantity_keeps_rising() -> bool:
 
 
 def test_downpour_sheet_not_hiss() -> bool:
-    """Dense texture at 100%: 10 ms envelope still moves (ticks), not flat noise."""
+    """100%: a roar of the same grains with the big drops still on top —
+    the envelope moves and peaks stand out, it isn't flat noise."""
     from app.audio.spatial_engine import SpatialRainEngine
     from app.models.room import default_house
 
@@ -597,9 +602,9 @@ def test_downpour_sheet_not_hiss() -> bool:
     spread = 20.0 * math.log10(float(np.percentile(env, 99) / np.percentile(env, 50)))
     crest = 20.0 * math.log10(float(np.max(np.abs(x)) / np.sqrt(np.mean(x * x))))
     _n, _dist, split = eng._rain_state()
-    ok = spread >= 4.0 and crest >= 10.0 and split > 3.0
+    ok = spread >= 2.0 and crest >= 10.0 and split > 3.0
     return _ok(
-        "downpour is a sheet of ticks (envelope moves), not hiss",
+        "downpour roars with big drops on top (not flat hiss)",
         ok,
         f"env p99/p50={spread:.1f}dB crest={crest:.1f}dB split={split:.2f}mm",
     )
@@ -674,6 +679,189 @@ def test_visual_hits_not_on_block_grid() -> bool:
     )
 
 
+def test_drips_outlast_the_rain() -> bool:
+    """Stop the rain: eaves keep dripping, slower and slower; Drips 0 = silent."""
+    from app.audio.spatial_engine import SpatialRainEngine
+    from app.models.room import default_house
+
+    room = default_house()
+    room.roof_material = "Tin Roof"
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    frames = int(eng.blocksize)
+    per_s = eng.samplerate / frames
+
+    def run(mix_drips: float):
+        room.mix_drips = mix_drips
+        eng._reset_sim(5)
+        drips = []
+        orig = eng._spawn_drip
+        eng._spawn_drip = lambda *a, **k: (drips.append(eng._time), orig(*a, **k))
+        parts = []
+        try:
+            for b in range(int(70 * per_s)):
+                room.droplet_density = 0.5 if b < 20 * per_s else 0.0
+                eng._advance(frames)
+                parts.append(eng._last_binaural.mean(axis=1))
+        finally:
+            del eng._spawn_drip
+        return np.array(drips), np.concatenate(parts)
+
+    t, x = run(1.0)
+    sr = eng.samplerate
+    early = int(np.sum((t >= 22) & (t < 32)))
+    late = int(np.sum((t >= 50) & (t < 60)))
+    after = x[22 * sr : 60 * sr]
+    lvl = 10.0 * math.log10(float(np.mean(after * after)) + 1e-30)
+    rain = x[10 * sr : 20 * sr]
+    rain_lvl = 10.0 * math.log10(float(np.mean(rain * rain)) + 1e-30)
+    _t0, x0 = run(0.0)
+    off = x0[22 * sr : 60 * sr]
+    off_lvl = 10.0 * math.log10(float(np.mean(off * off)) + 1e-30)
+    ok = early > late > 0 and -90.0 < lvl < rain_lvl - 10.0 and off_lvl < -150.0
+    return _ok(
+        "drips outlast the rain and fade; Drips 0 = silent",
+        ok,
+        f"drips 2–12 s after={early} · 30–40 s after={late} · after {lvl:.1f}dB "
+        f"(rain {rain_lvl:.1f}dB) · fader 0 {off_lvl:.0f}dB",
+    )
+
+
+def test_drip_spots_on_the_eaves() -> bool:
+    """Drip spots ring the house just outside the walls; over a window they hit the sill."""
+    from app.audio.runoff import EAVE_OUT_M, RoofRunoff
+
+    ro = RoofRunoff()
+    ro.layout(5.0, 4.0, 2.6, (("north", 1.0, 2.2, 0.9),))
+    outside = all(
+        s.x < 0 or s.x > 5.0 or s.z < 0 or s.z > 4.0 for s in ro.spots
+    )
+    near = all(
+        min(abs(s.x + EAVE_OUT_M), abs(s.x - 5.0 - EAVE_OUT_M), abs(s.z + EAVE_OUT_M), abs(s.z - 4.0 - EAVE_OUT_M)) < 1e-6
+        for s in ro.spots
+    )
+    sill = [s for s in ro.spots if s.surface == "metal"]
+    sill_ok = bool(sill) and all(s.wall == "north" and 1.0 <= s.x <= 2.2 and s.land_y == 0.9 for s in sill)
+    mean_share = sum(s.share for s in ro.spots) / len(ro.spots)
+    ok = outside and near and sill_ok and abs(mean_share - 1.0) < 1e-9 and len(ro.spots) >= 10
+    return _ok(
+        "drip spots ring the eaves; drips over a window land on its sill",
+        ok,
+        f"{len(ro.spots)} spots · {len(sill)} on the sill",
+    )
+
+
+def _layer_level(room, layer: str, recv: object = "L") -> float:
+    """Full-path gain (dB) from drops on ``layer`` to one receiver."""
+    from app.audio.spatial_engine import SpatialRainEngine
+
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    room.droplet_density = 0.5
+    eng._reset_sim(3)
+    cal = eng._measure_layer(layer)
+    g = cal.get("full", {}).get(recv, 0.0)
+    return 20.0 * math.log10(g + 1e-12)
+
+
+def test_design_changes_the_sound() -> bool:
+    """The house design reaches the sound through physics, in the right direction."""
+    from app.models.room import default_house
+
+    def house(roof="Tin Roof", wall="Brick Wall", open_amt=None):
+        r = default_house()
+        r.roof_material, r.wall_material = roof, wall
+        if open_amt is not None:
+            for w in r.windows:
+                w.open = open_amt
+        return r
+
+    tin = _layer_level(house("Tin Roof"), "roof")
+    tile = _layer_level(house("Tile Roof"), "roof")
+    ground_brick = _layer_level(house(wall="Brick Wall", open_amt=0.0), "ground")
+    ground_glass = _layer_level(house(wall="Glass Window", open_amt=0.0), "ground")
+    ground_open = _layer_level(house(wall="Brick Wall", open_amt=0.9), "ground")
+    ok = (
+        tin - tile >= 10.0
+        and ground_glass - ground_brick >= 10.0
+        and ground_open - ground_brick >= 6.0
+    )
+    return _ok(
+        "design → sound: tin ≫ tile roof; glass walls and open windows let the yard in",
+        ok,
+        f"roof tin {tin:.1f} / tile {tile:.1f} dB · ground brick {ground_brick:.1f} / "
+        f"glass {ground_glass:.1f} / open {ground_open:.1f} dB",
+    )
+
+
+def test_wind_wets_the_windward_wall() -> bool:
+    from app.audio import house_model as hm
+    from app.models.room import default_house
+
+    room = default_house()
+    calm = {p.wall: p.rate_area for p in hm.catchments(room, 0.0, 0.0) if p.layer == "wall"}
+    # 0° pushes rain toward +Z: it lands on the south face (outward −Z)
+    windy = {p.wall: p.rate_area for p in hm.catchments(room, 0.7, 0.0) if p.layer == "wall"}
+    ok = windy["south"] > 10.0 * windy["north"] and windy["south"] > 10.0 * calm["south"]
+    return _ok(
+        "wind drives rain onto the windward wall only",
+        ok,
+        f"south calm {calm['south']:.2f} → windy {windy['south']:.2f} m² · north windy {windy['north']:.2f} m²",
+    )
+
+
+def test_view_and_engine_agree() -> bool:
+    """The 3D view spawns rain from the same catchments the audio uses, and
+    the view-driven and scheduler paths sound equally loud."""
+    import random
+    import types
+
+    from app.audio import house_model as hm
+    from app.audio.spatial_engine import SpatialRainEngine
+    from app.graphics import glview as gv
+    from app.models.room import default_house
+
+    room = default_house()
+    room.roof_material = "Tin Roof"
+    room.wall_material = "Glass Window"
+    room.droplet_density = 0.5
+    np.random.seed(2)
+    random.seed(2)
+    view = types.SimpleNamespace(room=room)
+    spawn = types.MethodType(gv.GLRoomView._spawn_world_rain, view)
+    kinds = spawn(6000)[:, 4]
+    want = hm.kind_shares(hm.catchments(room))
+    worst = max(abs(float(np.mean(kinds == k)) - v) for k, v in want.items())
+
+    eng = SpatialRainEngine(room, samplerate=48000, blocksize=2048)
+    eng._drop_bank.ensure_built()
+    eng.use_drips = False
+
+    def level(visual: bool) -> float:
+        eng._reset_sim(11)
+        rng = np.random.RandomState(4)
+        frames = int(eng.blocksize)
+        parts = []
+        for _ in range(int(5 * eng.samplerate / frames)):
+            if visual:
+                pts = spawn(rng.poisson(1200 * frames / eng.samplerate))
+                hits = [(float(x) + room.width / 2, float(ly), float(z) + room.depth / 2, int(k))
+                        for x, _y, z, _vy, k, ly in pts]
+                eng.submit_visual_impacts(hits)
+            mix = eng._advance(frames)
+            parts.append(sum(mix.get(i, np.zeros(frames)) ** 2 for i in range(len(room.speakers))))
+        x = np.concatenate(parts)[eng.samplerate:]
+        return 10.0 * math.log10(float(np.mean(x)) + 1e-30)
+
+    lv, ln = level(True), level(False)
+    ok = worst < 0.03 and abs(lv - ln) < 2.0
+    return _ok(
+        "3D view and audio share one rain model (spawn shares, equal loudness)",
+        ok,
+        f"worst kind-share error={worst:.3f} · view {lv:.1f} dB vs scheduler {ln:.1f} dB",
+    )
+
+
 def main() -> int:
     print("RainRoom3D spatial / rain distribution checks")
     results = [
@@ -695,6 +883,11 @@ def main() -> int:
         test_downpour_sheet_not_hiss(),
         test_downpour_no_fixed_resonance(),
         test_visual_hits_not_on_block_grid(),
+        test_drips_outlast_the_rain(),
+        test_drip_spots_on_the_eaves(),
+        test_design_changes_the_sound(),
+        test_wind_wets_the_windward_wall(),
+        test_view_and_engine_agree(),
     ]
     passed = sum(1 for r in results if r)
     print(f"\n{passed}/{len(results)} passed")

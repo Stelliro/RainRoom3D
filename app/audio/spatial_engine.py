@@ -25,7 +25,7 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,8 +38,19 @@ from app.audio.drop_bank import SHARP_BINS, SIZE_BINS_MM, DropSampleBank, _neare
 from app.audio.engine import synth_drop, _db, _peak_cap
 from app.audio.field_bed import OutdoorFieldBed
 from app.audio.field_router import OutdoorFieldRouter
-from app.audio.rain_dsd import D_MAX_MM, D_MIN_MM, DropSizeDist, dsd_for_quantity, impact_amp, loudness_gain
+from app.audio.rain_dsd import (
+    D_MAX_MM,
+    D_MIN_MM,
+    DropSizeDist,
+    dsd_for_quantity,
+    impact_amp,
+    loudness_gain,
+    quantity_to_rain_rate,
+    terminal_velocity,
+)
 from app.audio.rain_texture import VARIANTS_PER_SIZE, DenseRainTexture, make_variants
+from app.audio import house_model as hm
+from app.audio.runoff import DripSpot, RoofRunoff
 from app.audio.reverb import MonoRoomReverb, StereoRoomReverb, room_reverb_from_layout
 from app.audio.spatial import (
     C_SOUND,
@@ -67,15 +78,41 @@ _MAX_VOICE_EVENTS_PER_SEC = 170.0
 _MAX_SPAWN_PER_BLOCK = 36
 _DEFAULT_MAX_VOICES = 300
 _MAX_STEREO_VOICES = 180
-# Dense-texture sources → visual hit kind (3 roof, 2 window, 1 yard)
-_DENSE_SOURCES = {"roof": 3, "near": 2, "yard": 1}
+# 3D-view hit kinds → catchment layer (see house_model.catchments)
+_KIND_LAYER = {1: "ground", 2: "window", 3: "roof", 4: "wall", 5: "sill"}
+_LAYER_KIND = {v: k for k, v in _KIND_LAYER.items()}
+# Calibration probe spots per layer (full path vs the 3D view's cheap taps)
+_CAL_POINTS = 16
+_CAL_CHUNK = 4
+# Drips are as loud as the voiced drops of this quantity, whatever the slider
+# says now (they keep falling after it hits 0).
+_DRIP_REF_Q = 0.35
+# Drop size → timbre. Smaller drops ring higher and shorter, bigger ones lower
+# and fuller: playback rate (D_REF/D)^exp. 0 = every size sounds the same.
+_SIZE_PITCH_EXP = 0.35
+_SIZE_PITCH_REF_MM = 3.0
+# Dense sheet above its grain cap: 1 = louder grains, 0 = continuous roar
+_DENSE_HIT_MAKEUP = 0.25
+_DRIP_GAIN = 0.45
+# Gutter trickle: splashes/s per downspout at full flow, and its level.
+# The portal model has no structure-borne path (a downspout is bolted to the
+# house), so the gain is set by measurement: ~6 dB under the eave drips just
+# after the rain stops.
+_GUTTER_MAX_RATE = 700.0
+_GUTTER_HALF_FLOW = 10.0
+_GUTTER_GAIN = 30.0
 # Biggest drops/s that get their own spatial voice; the rest are dense texture.
 _DISCRETE_BUDGET_PER_SEC = 150.0
 # Calibrates physical impact_amp (1.0 = 3 mm drop) to the engine's mix level.
 _DROP_LEVEL = 0.55
 # The portal render (no 3D view) couples ~3 dB hotter than the cheap taps
 # the 3D view uses; trim it so switching tabs doesn't jump the volume.
-_EVENT_PATH_TRIM = 0.65
+# One level for every drop, both paths. Anchored so the original tin-roof
+# house kept its loudness when the per-layer gains were replaced by physics.
+_LEVEL_TRIM = 2.11
+# Ears vs speakers on the full path (was 1.55; −8.8 dB keeps the headphone
+# level where the tin-roof house had it while speakers come up to theirs)
+_HP_PATH_GAIN = 0.56
 
 
 def _soft_clip(sig: np.ndarray, ceiling: float = 0.88) -> np.ndarray:
@@ -477,6 +514,17 @@ def _add_2d(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
+def _wide_full(cal: Dict[str, Dict[object, float]]) -> Dict[str, Dict[object, float]]:
+    """Speaker entries of "full" := full/cheap ratio × wide-averaged cheap gain."""
+    full, cheap, wide = cal.get("full", {}), cal.get("cheap", {}), cal.pop("wide", {})
+    for k, w in wide.items():
+        c = cheap.get(k, 0.0)
+        if c > 1e-12 and k in full:
+            full[k] = full[k] / c * w
+            cheap[k] = w
+    return cal
+
+
 class _TapVoice:
     """One outdoor drop, already path-traced to each receiver channel."""
 
@@ -673,9 +721,21 @@ class SpatialRainEngine:
         self._dense = DenseRainTexture(sr=self.samplerate, n_stems=3, seed=777)
         self._dense_kernel_id: Optional[tuple] = None
         self._dense_kernel_gain: Dict[str, float] = {}
-        self._dense_cal: Optional[Dict[str, Dict[object, float]]] = None
-        self._dense_cal_fp: Optional[tuple] = None
-        self._dense_cal_t = -1e9
+        self._last_dense_gains: Dict[str, Dict[object, float]] = {}
+        # Path calibration per catchment layer: {"full": {recv: g}, "cheap": {recv: g}}
+        self._path_cal: Dict[str, Dict[str, Dict[object, float]]] = {}
+        self._cal_fp: Optional[tuple] = None
+        self._cal_pending: List[str] = []
+        self._cal_new: Dict[str, Dict[str, Dict[object, float]]] = {}
+        self._cal_t = -1e9
+        self._patch_key: Optional[tuple] = None
+        self._patch_cache: List[hm.Patch] = []
+        # Roof runoff: eave drips + gutter trickle that outlast the rain
+        self.use_drips = True
+        # Scheduled drops (no 3D view) use the same calibrated taps as the view;
+        # True renders each through the full wall/window path (offline quality).
+        self.full_path_events = False
+        self._runoff = RoofRunoff(seed=31)
         self._visual_active = False
         self._visual_rate = 0.0
 
@@ -781,12 +841,28 @@ class SpatialRainEngine:
         self._wind_speed_eff += max(-slew_s * dt, min(slew_s * dt, ds))
         self._wind_speed_eff = max(0.0, min(1.0, self._wind_speed_eff))
 
+    def _patches(self) -> List[hm.Patch]:
+        """Where rain lands on this house, from its geometry, materials and wind."""
+        r = self.room
+        wins = tuple(
+            (str(getattr(w, "wall", "")), round(float(getattr(w, "offset", 0.0) or 0.0), 2),
+             round(float(getattr(w, "width", 1.0) or 1.0), 2), round(float(getattr(w, "sill", 0.9) or 0.0), 2),
+             round(float(getattr(w, "height", 1.2) or 1.2), 2))
+            for w in (getattr(r, "windows", []) or [])
+        )
+        key = (
+            round(float(r.width), 2), round(float(r.depth), 2), round(float(r.height), 2),
+            str(getattr(r, "roof_material", "")), str(getattr(r, "wall_material", "")), wins,
+            round(self._wind_speed(), 2), round(self._wind_dir_deg() / 3.0),
+        )
+        if key != self._patch_key:
+            self._patch_cache = hm.catchments(r, self._wind_speed(), self._wind_dir_deg())
+            self._patch_key = key
+        return self._patch_cache
+
     def _rain_area(self) -> float:
-        """Catchment that can be heard: roof plus a ~0.85 m eaves/yard ring."""
-        rw = max(0.5, float(self.room.width))
-        rd = max(0.5, float(self.room.depth))
-        ring = 0.85
-        return rw * rd + 2.0 * ring * (rw + rd) + 4.0 * ring * ring
+        """Horizontal-equivalent catchment of every surface (m²)."""
+        return hm.catchment_area(self._patches())
 
     def _discrete_budget(self) -> float:
         """Voiced drops/s. With the 3D view driving, never more than it lands."""
@@ -804,7 +880,7 @@ class SpatialRainEngine:
         rate, dist = dsd_for_quantity(q)
         if rate <= 0.0:
             return 0.0, None, D_MAX_MM
-        area = self._rain_area() * (1.0 + 0.10 * self._wind_speed())
+        area = self._rain_area()
         split = dist.split_for_rate(self._discrete_budget(), area)
         return float(dist.flux(split) * area), dist, float(split)
 
@@ -863,112 +939,34 @@ class SpatialRainEngine:
         return -d, 0.02, float(rd + d - t), d, "west"
 
     def _layer_probs(self) -> Dict[str, float]:
-        """Share of landings per layer (roof / wall / near-window / yard)."""
-        r = self.room
-        q_amt = max(0.0, min(1.0, float(getattr(r, "droplet_density", 0.5) or 0.0)))
-        roof_mat = str(getattr(r, "roof_material", "") or "").lower()
-        tin = ("tin" in roof_mat) or ("metal" in roof_mat)
-        p_roof = (0.82 + 0.06 * q_amt) if tin else (0.70 + 0.08 * q_amt)
-        p_wall = 0.06
-        p_near = 0.08 if (getattr(r, "windows", None) or []) else 0.0
-        return {
-            "roof": p_roof,
-            "wall": p_wall,
-            "near": p_near,
-            "yard": max(0.0, 1.0 - p_roof - p_wall - p_near),
-        }
+        """Share of landings per catchment layer (roof / wall / window / sill / ground)."""
+        return hm.layer_shares(self._patches())
 
     def _pick_source_3d(self) -> Tuple[str, float, float, float, float]:
-        """Outdoor impacts on the room footprint plus a thin eaves ring.
+        """One landing, by catchment area. Returns (layer, x, y, z, metres outside)."""
+        patch = hm.pick_patch(self._patches(), self._rng)
+        if patch is None:
+            return "roof", float(self.room.width) * 0.5, float(self.room.height), float(self.room.depth) * 0.5, 0.0
+        x, y, z = hm.sample_point(self.room, patch, self._rng)
+        w, d = float(self.room.width), float(self.room.depth)
+        out = max(0.0, -x, x - w, -z, z - d)
+        return patch.layer, float(x), float(y), float(z), float(out)
 
-        Quantity is rain *on the house*, not a 40 m field. A little overshoot
-        (gutters / drip line / window lip) keeps the four facades fed.
-
-        Returns (layer, x, y, z, depth_m_from_house).
-        """
-        p = self._layer_probs()
-        u = float(self._rng.rand())
-        t_wall = p["roof"] + p["wall"]
-        t_near = t_wall + p["near"]
-        if u < p["roof"]:
-            layer = "roof"
-        elif u < t_wall:
-            layer = "wall"
-        elif p["near"] > 0.0 and u < t_near:
-            layer = "near"
-        else:
-            layer = "yard"
-        return self._point_for_layer(layer)
-
-    def _point_for_layer(self, layer: str) -> Tuple[str, float, float, float, float]:
-        r = self.room
-        rng = self._rng
-        wx, wz = self._wind_push()
-        windows = list(getattr(r, "windows", []) or [])
-        rw = max(0.5, float(r.width))
-        rd = max(0.5, float(r.depth))
-        rh = max(1.5, float(r.height))
-
-        def _along_window(win, out_dist: float):
-            wall = (getattr(win, "wall", "north") or "north").lower()
-            cx, cy, cz = r.window_center(win)
-            lat = float(rng.uniform(-0.55, 0.55)) * float(getattr(win, "width", 1.0))
-            vert = float(rng.normal(0.0, 0.35))
-            y = max(0.0, cy + vert)
-            if wall == "north":
-                return cx + lat, y, cz + out_dist
-            if wall == "south":
-                return cx + lat, y, cz - out_dist
-            if wall == "east":
-                return cx + out_dist, y, cz + lat
-            return cx - out_dist, y, cz + lat
-
-        if layer == "near" and not windows:
-            layer = "yard"
-        if layer == "roof":
-            x = float(rng.uniform(0.05, max(0.15, rw - 0.05)))
-            z = float(rng.uniform(0.05, max(0.15, rd - 0.05)))
-            y = rh + 0.03
-            depth = 0.0
-        elif layer == "wall":
-            x, _y, z, depth, _w = self._ring_point(float(rng.uniform(0.05, 0.45)))
-            y = float(rng.uniform(0.15, rh * 0.92))
-        elif layer == "near":
-            weights = np.array(
-                [max(0.05, float(getattr(w, "open", 0.7))) for w in windows],
-                dtype=np.float64,
-            )
-            weights /= weights.sum()
-            win = windows[int(rng.choice(len(windows), p=weights))]
-            depth = float(rng.uniform(0.12, 0.70))
-            x, y, z = _along_window(win, depth)
-            y = float(rng.uniform(0.0, max(0.15, getattr(win, "sill", 0.9) * 0.45)))
-        else:
-            layer = "yard"
-            depth = float(rng.uniform(0.12, 0.85))
-            x, y, z, depth, _w = self._ring_point(depth)
-
-        # Wind is a drift, not a spawn filter — keep it small so hits stay on the house
-        x += wx * float(rng.uniform(0.02, 0.18)) * (0.25 + 0.04 * depth)
-        z += wz * float(rng.uniform(0.02, 0.18)) * (0.25 + 0.04 * depth)
-        return layer, float(x), float(y), float(z), float(depth)
+    def _point_for_layer(self, layer: str) -> Optional[Tuple[float, float, float]]:
+        patch = hm.pick_patch([p for p in self._patches() if p.layer == layer], self._rng)
+        if patch is None:
+            return None
+        return hm.sample_point(self.room, patch, self._rng)
 
     def _surface_for_layer(self, layer: str) -> str:
         if layer == "roof":
-            return _material_surface(getattr(self.room, "roof_material", "Metal Roof"))
-        if layer == "near":
-            return "glass"
+            return hm.roof_material(self.room).surface
         if layer == "wall":
-            base = _material_surface(getattr(self.room, "wall_material", "Brick Wall"))
-            if base in ("metal", "glass"):
-                return "brick"
-            return base if base in ("wood", "brick", "tile", "shingle") else "brick"
-        # Yard / mid / far / canopy: wet water mass; rare hollow accents
-        u = float(self._rng.rand())
-        if layer == "canopy" and u < 0.008:
-            return "shell"
-        if layer == "yard" and u < 0.04:
-            return "wood"  # occasional deck / cover
+            return hm.wall_material(self.room).surface
+        if layer in ("window", "near"):
+            return "glass"
+        if layer == "sill":
+            return "metal"
         return "water"
 
     def _speaker_receive(
@@ -1043,8 +1041,14 @@ class SpatialRainEngine:
         hollow ring. Small random rates keep every hit's spectrum different."""
         return math.exp(float(self._rng.uniform(-0.09, 0.09)))
 
-    def _jitter_grain(self, mono: np.ndarray) -> np.ndarray:
-        rate = self._grain_rate_jitter()
+    def _size_rate(self, d_mm: float) -> float:
+        if _SIZE_PITCH_EXP <= 0.0:
+            return 1.0
+        r = (_SIZE_PITCH_REF_MM / max(0.3, float(d_mm))) ** _SIZE_PITCH_EXP
+        return max(0.70, min(1.50, r))
+
+    def _jitter_grain(self, mono: np.ndarray, base_rate: float = 1.0) -> np.ndarray:
+        rate = self._grain_rate_jitter() * base_rate
         if len(mono) <= 32:
             return mono
         n_out = max(24, int(round(len(mono) / rate)))
@@ -1087,9 +1091,17 @@ class SpatialRainEngine:
                 best = g
         return float(best)
 
+    def _cheap_spk_gains(self, src: Tuple[float, float, float], kind: int) -> List[Tuple[int, float, int]]:
+        """(speaker, gain, delay samples) of the cheap tap path."""
+        out = []
+        for i, sig, delay_n in self._cheap_taps_for_hit(None, src, kind):
+            out.append((i, sig, delay_n))
+        return out
+
     def _cheap_taps_for_hit(
-        self, mono: np.ndarray, src: Tuple[float, float, float], kind: int
+        self, mono: Optional[np.ndarray], src: Tuple[float, float, float], kind: int
     ) -> List[Tuple[int, np.ndarray, int]]:
+        """Taps for ``mono``; with ``mono=None`` returns (speaker, gain, delay)."""
         sx, sy, sz = src
         couple = self._portal_gain_cheap(sx, sy, sz, kind)
         sr = self.samplerate
@@ -1113,11 +1125,64 @@ class SpatialRainEngine:
                 continue
             delay_n = int(round((d / C_SOUND) * sr))
             delay_n = max(0, min(delay_n, int(0.12 * sr)))
+            if mono is None:
+                taps.append((i, g, delay_n))
+                continue
             sig = mono * g
             if delay_n > 0:
                 sig = np.concatenate([np.zeros(delay_n), sig])
             taps.append((i, sig, 0))
         return taps
+
+    def _drop_grain(self, surface: str, drop_d: float, layer: str, rng=None) -> np.ndarray:
+        """The sound of one drop on ``surface`` — the same recipe for the 3D
+        view, the scheduler and the dense texture. Scaled by how loudly that
+        material rings (house_model.surface_radiate)."""
+        rng = self._rng if rng is None else rng
+        q = max(0.0, min(1.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0)))
+        hit_sharp = max(0.12, min(0.95, self._sharpness() + 0.06 * q))
+        twt = max(0.0, min(1.0, float(getattr(self.room, "tone_weight", 0.5) or 0.5)))
+        size = drop_d * (0.55 + 0.90 * twt) * (1.12 if layer == "roof" else 1.0)
+        try:
+            self._drop_bank.ensure_built()
+            mono = self._drop_bank.pick(surface=surface, size_mm=size, sharpness=hit_sharp, chain_n=1, rng=rng)
+        except Exception:
+            mono = synth_drop(sr=self.samplerate, surface=surface, size_mm=size, seed=self._evt_id,
+                              sharpness=hit_sharp, tone_ring=0.0 if surface == "metal" else None)
+        mono = self._jitter_grain(mono, self._size_rate(drop_d) * self._tone_rate())
+        return self._shape_grain(mono, surface) * hm.surface_radiate(surface)
+
+    def _tone_rate(self) -> float:
+        """Ear-lab pitch: 0 → ~0.88× (deeper), 1 → ~1.12× (higher)."""
+        tp = max(0.0, min(1.0, float(getattr(self.room, "tone_pitch", 0.5) or 0.5)))
+        return 0.88 + 0.24 * tp
+
+    def _shape_grain(self, mono: np.ndarray, surface: str) -> np.ndarray:
+        q = max(0.0, min(1.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0)))
+        if surface == "metal":
+            # Slightly shorter at downpour so new attacks aren't buried in tails.
+            return self._short_grain(mono, ms=52.0 - 8.0 * q, fade_ms=4.0)
+        return self._short_grain(mono, ms=26.0 + 4.0 * q, fade_ms=8.0)
+
+    def _hit_amp(self, drop_d: float) -> float:
+        mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
+        return (
+            self._drop_amp(drop_d)
+            * math.exp(float(self._rng.normal(0.0, 0.25)))
+            * self._master
+            * (mix_d ** 0.85)
+            * (0.70 + 0.22 * self._sharpness())
+            * _LEVEL_TRIM
+        )
+
+    def _cheap_cal(self, layer: str) -> Dict[object, float]:
+        """Per-receiver factor that brings the 3D view's cheap taps up/down to
+        the full wall/window path for this layer."""
+        cal = self._path_cal.get(layer)
+        if not cal:
+            return {}
+        full, cheap = cal.get("full", {}), cal.get("cheap", {})
+        return {k: (full.get(k, 0.0) / cheap[k]) if cheap.get(k, 0.0) > 1e-9 else 0.0 for k in set(full) | set(cheap)}
 
     def _spawn_visual_hit(self, hit: Tuple[float, float, float, int], delay_n: int = 0) -> None:
         """One OpenGL droplet landing → its own stacked grain, ``delay_n``
@@ -1135,60 +1200,24 @@ class SpatialRainEngine:
             keep = self._discrete_budget() / self._visual_rate
             if keep < 1.0 and float(self._rng.rand()) > keep:
                 return
-        if kind == 3:
-            surface = self._surface_for_layer("roof")
-        elif kind == 2:
-            surface = "glass"
-        else:
-            surface = self._surface_for_layer("yard")
-        sharp = self._sharpness()
+        layer = _KIND_LAYER.get(kind, "ground")
+        surface = self._surface_for_layer(layer)
         # A drawn droplet stands for one of the big drops; the dense texture
         # carries the ones too small / many to draw.
         _n, dist, split = self._rain_state()
         drop_d = float(dist.sample(1, self._rng, split, D_MAX_MM)[0]) if dist is not None else 2.0
-        size = drop_d * (1.12 if kind == 3 else 1.0)
-        mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
-        amp = (
-            self._drop_amp(drop_d)
-            * math.exp(float(self._rng.normal(0.0, 0.25)))
-            * self._master
-            * (mix_d ** 0.85)
-            * (0.70 + 0.22 * sharp)
-        )
-        # Stay on the user's sharpness bin. Forcing 0.88 at downpour made plastic clacks.
-        hit_sharp = max(0.12, min(0.95, sharp + 0.06 * q))
-        try:
-            self._drop_bank.ensure_built()
-            mono = self._drop_bank.pick(
-                surface=surface,
-                size_mm=size,
-                sharpness=hit_sharp,
-                chain_n=1,
-                rng=self._rng,
-            )
-        except Exception:
-            from app.audio.engine import synth_drop
-            mono = synth_drop(
-                sr=self.samplerate,
-                surface=surface,
-                size_mm=size,
-                seed=self._evt_id,
-                sharpness=hit_sharp,
-                tone_ring=0.0 if surface == "metal" else None,
-            )
+        mono = self._drop_grain(surface, drop_d, layer) * self._hit_amp(drop_d)
         self._evt_id += 1
-        mono = self._jitter_grain(mono)
-        if surface == "metal":
-            # Slightly shorter at downpour so new attacks aren't buried in tails.
-            grain_ms = 52.0 - 8.0 * q
-            amp *= 1.18 + 0.22 * q
-            mono = self._short_grain(mono, ms=grain_ms, fade_ms=4.0) * amp
-        else:
-            grain_ms = 26.0 + 4.0 * q
-            amp *= 0.32
-            mono = self._short_grain(mono, ms=grain_ms, fade_ms=8.0) * amp
-        src = (sx, sy, sz)
+        self._queue_cheap(mono, (sx, sy, sz), kind, layer, delay_n)
+
+    def _queue_cheap(self, mono: np.ndarray, src: Tuple[float, float, float], kind: int,
+                     layer: str, delay_n: int = 0) -> None:
+        """Delay/distance taps to each speaker and a fast HRTF to the ears,
+        levelled per layer to the full wall/window path (_path_cal)."""
+        cal = self._cheap_cal(layer)
         taps = self._cheap_taps_for_hit(mono, src, kind)
+        if cal:
+            taps = [(ch, buf * cal.get(ch, 0.0), pos) for ch, buf, pos in taps if cal.get(ch, 0.0) > 0.0]
         delay_n = max(0, int(delay_n))
         if taps:
             if delay_n:
@@ -1198,150 +1227,55 @@ class SpatialRainEngine:
             self._voices.append(_TapVoice(taps, kind=kind))
         max_bi = min(self.max_voices, _MAX_STEREO_VOICES)
         if self.render_listener_binaural and len(self._stereo_voices) < max_bi:
-            L = self.room.listener
-            lx, ly, lz = float(L.x), float(getattr(L, "y", 1.2)), float(L.z)
-            yaw = float(getattr(L, "yaw", 0.0))
-            dx, dy, dz = sx - lx, sy - ly, sz - lz
-            dist = max(0.25, math.sqrt(dx * dx + dy * dy + dz * dz))
-            az = math.atan2(dx, dz) - yaw
-            el = math.asin(max(-1.0, min(1.0, dy / dist)))
-            g = self._portal_gain_cheap(sx, sy, sz, kind)
-            g *= distance_attenuation(dist, ref=0.6, rolloff=1.1)
-            stereo = binaural(mono * g * 1.35, az, el, distance=dist, sr=self.samplerate, quality="fast")
-            if float(np.max(np.abs(stereo))) > 1e-7:
+            stereo = self._cheap_binaural(mono, src, kind)
+            if cal and stereo is not None:
+                stereo = stereo * np.array([cal.get("L", 0.0), cal.get("R", 0.0)])[None, :]
+            if stereo is not None and float(np.max(np.abs(stereo))) > 1e-7:
                 if delay_n:
                     stereo = np.concatenate([np.zeros((delay_n, stereo.shape[1])), stereo])
                 self._stereo_voices.append(_StereoVoice(stereo))
 
-    def _event_layer_gain(self, layer: str, surface: str) -> float:
-        """Coupling of a landing layer into the room (non-visual path)."""
-        wabs = self._wind_speed()
-        sharp = self._sharpness()
-        g = 1.0
-        if surface in ("tarp", "shell", "plastic", "hollow"):
-            g *= 0.78
-        if layer == "far":
-            g *= 0.30
-        elif layer == "mid":
-            g *= 0.68
-        elif layer == "yard":
-            g *= 0.18 + 0.06 * wabs if surface != "metal" else 0.22
-        elif layer == "wall":
-            g *= 0.70 + 0.12 * wabs
-        elif layer == "roof":
-            g *= 1.40 + 0.18 * wabs if surface == "metal" else (0.85 + 0.12 * wabs)
-        elif layer == "canopy":
-            g *= 0.42 + 0.10 * wabs
-        elif layer == "near":
-            g *= 1.05 + 0.15 * wabs
-        g *= 0.65 + 0.25 * sharp
-        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
-        g *= 0.78 + 0.35 * wabs * (0.35 + 0.65 * min(1.5, mix_wind))
-        return float(g)
+    def _cheap_binaural(self, mono: np.ndarray, src: Tuple[float, float, float], kind: int) -> Optional[np.ndarray]:
+        L = self.room.listener
+        sx, sy, sz = src
+        lx, ly, lz = float(L.x), float(getattr(L, "y", 1.2)), float(L.z)
+        dx, dy, dz = sx - lx, sy - ly, sz - lz
+        dist = max(0.25, math.sqrt(dx * dx + dy * dy + dz * dz))
+        az = math.atan2(dx, dz) - float(getattr(L, "yaw", 0.0))
+        el = math.asin(max(-1.0, min(1.0, dy / dist)))
+        g = self._portal_gain_cheap(sx, sy, sz, kind) * distance_attenuation(dist, ref=0.6, rolloff=1.1)
+        return binaural(mono * g * 1.35, az, el, distance=dist, sr=self.samplerate, quality="fast")
 
     def _spawn_event(self, schedule_delay_n: int = 0):
-        """Spawn outdoor impact chain → couple indoors → speakers / ears."""
-        layer, x, y, z, depth = self._pick_source_3d()
-        surface = self._surface_for_layer(layer)
-        sharp = self._sharpness()
-        wabs = self._wind_speed()
-        q = float(getattr(self.room, "droplet_density", 0.5) or 0.5)
-        chain_n = self._chain_hits()
-
-        # Physical size: the biggest drops (above the dense/discrete split)
+        """One scheduled landing (no 3D view) → full wall/window path."""
+        if len(self._voices) >= self.max_voices and len(self._stereo_voices) >= self.max_voices:
+            self._evt_id += 1
+            return
         _n, dist, split = self._rain_state()
         if dist is None:
             self._evt_id += 1
             return
+        layer, x, y, z, _out = self._pick_source_3d()
         drop_d = float(dist.sample(1, self._rng, split, D_MAX_MM)[0])
-        # tone_weight only shifts the grain timbre, not the physical loudness
-        twt = max(0.0, min(1.0, float(getattr(self.room, "tone_weight", 0.5) or 0.5)))
-        size = drop_d * (0.55 + 0.90 * twt)
-        # Roof / wall impacts run a bit larger (mass of surface hit)
-        if layer == "roof":
-            size *= 1.12
-        elif layer == "wall":
-            size *= 1.05
-
-        hit_sharp = max(0.0, min(1.0, sharp + 0.35 * wabs * (0.5 + 0.5 * sharp)))
-        hit_sharp *= 0.72 + 0.28 * max(0.0, min(1.0, q)) ** 0.6
-
-        if len(self._voices) >= self.max_voices and len(self._stereo_voices) >= self.max_voices:
-            self._evt_id += 1
-            return
-
-        # Prefer pre-baked bank (cheap). Live synth only if bank off / fail.
-        if self.use_drop_bank:
-            try:
-                self._drop_bank.ensure_built()
-                mono = self._drop_bank.pick(
-                    surface=surface,
-                    size_mm=size,
-                    sharpness=hit_sharp,
-                    chain_n=chain_n,
-                    rng=self._rng,
-                )
-            except Exception:
-                log.exception("drop bank pick failed — live synth fallback")
-                mono = synth_drop(
-                    sr=self.samplerate,
-                    surface=surface,
-                    size_mm=size,
-                    seed=self._evt_id,
-                    sharpness=hit_sharp,
-                    tone_pitch=float(getattr(self.room, "tone_pitch", 0.5) or 0.5),
-                    tone_ring=float(getattr(self.room, "tone_ring", 0.3) or 0.3),
-                    tone_wet=float(getattr(self.room, "tone_wet", 0.85) or 0.85),
-                    tone_soft=float(getattr(self.room, "tone_soft", 0.55) or 0.55),
-                )
-        else:
-            mono = synth_drop(
-                sr=self.samplerate,
-                surface=surface,
-                size_mm=size,
-                seed=self._evt_id,
-                sharpness=hit_sharp,
-                tone_pitch=float(getattr(self.room, "tone_pitch", 0.5) or 0.5),
-                tone_ring=float(getattr(self.room, "tone_ring", 0.3) or 0.3),
-                tone_wet=float(getattr(self.room, "tone_wet", 0.85) or 0.85),
-                tone_soft=float(getattr(self.room, "tone_soft", 0.55) or 0.55),
-            )
-
-        # Light live tone pitch via rate (bank is fixed; ear-lab still works)
-        tp = max(0.0, min(1.0, float(getattr(self.room, "tone_pitch", 0.5) or 0.5)))
-        # pitch 0 → slower/deeper (~0.88×), 1 → faster/higher (~1.12×)
-        pitch_rate = 0.88 + 0.24 * tp
-        rate = self._droplet_playback_rate(q) * pitch_rate * self._grain_rate_jitter()
-        if abs(rate - 1.0) > 0.008 and len(mono) > 32:
-            n_out = max(24, int(round(len(mono) / rate)))
-            if n_out != len(mono):
-                xp = np.arange(len(mono), dtype=np.float64)
-                xq = np.linspace(0.0, len(mono) - 1, n_out)
-                mono = np.interp(xq, xp, mono).astype(np.float64)
-
-        fade_ms = 2.5 + 3.5 * (1.0 - max(0.0, min(1.0, q)))
-        fade_n = max(8, int(fade_ms * 0.001 * self.samplerate))
-        if len(mono) > fade_n:
-            mono = mono.copy()
-            mono[:fade_n] *= np.linspace(0.0, 1.0, fade_n, dtype=np.float64)
-            if q < 0.35 and len(mono) > fade_n * 2:
-                mono[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float64)
-
-        mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
-        chain_k = 1.0
-        # Heavy-tailed: drop size sets loudness (~25 dB from 1 mm to 3 mm)
-        amp = (
-            self._drop_amp(drop_d)
-            * math.exp(float(self._rng.normal(0.0, 0.25)))
-            * self._master
-            * (mix_d ** 0.85)
-            * _EVENT_PATH_TRIM
-        )
-        amp *= self._event_layer_gain(layer, surface)
-        mono = mono * amp
+        surface = self._surface_for_layer(layer)
+        mono = self._drop_grain(surface, drop_d, layer) * self._hit_amp(drop_d)
         self._evt_id += 1
-        src = (x, y, z)
+        if self.full_path_events or not self._path_cal:
+            self._render_and_queue(mono, (x, y, z), layer, schedule_delay_n, 0)
+        else:
+            self._queue_cheap(mono, (x, y, z), _LAYER_KIND.get(layer, 1), layer, schedule_delay_n)
+
+    def _render_and_queue(
+        self,
+        mono: np.ndarray,
+        src: Tuple[float, float, float],
+        layer: str,
+        schedule_delay_n: int = 0,
+        fade_n: int = 0,
+    ) -> None:
+        """Full wall/window path to every speaker, wall bus and the ears."""
         sr = self.samplerate
+        chain_k = 1.0
 
         busy = len(self._voices) > self.max_voices * 0.40
         binaural_q = "fast" if busy else "full"
@@ -1413,7 +1347,7 @@ class SpatialRainEngine:
 
         if stereo is not None and want_bi:
             if float(np.max(np.abs(stereo))) > 1e-7:
-                stereo = stereo * 1.55
+                stereo = stereo * _HP_PATH_GAIN
                 if delay0 > 0:
                     pad = np.zeros((delay0, 2), dtype=np.float64)
                     stereo = np.vstack([pad, stereo])
@@ -1423,51 +1357,131 @@ class SpatialRainEngine:
                     stereo[:n0] *= np.linspace(0.0, 1.0, n0, dtype=np.float64)[:, None]
                 self._stereo_voices.append(_StereoVoice(stereo))
 
+    # ----- roof runoff: eave drips -----
+    def _runoff_windows(self) -> Tuple[Tuple[str, float, float, float], ...]:
+        out = []
+        for w in getattr(self.room, "windows", []) or []:
+            if getattr(w, "free_place", False):
+                continue
+            lo = float(getattr(w, "offset", 0.0) or 0.0)
+            out.append((
+                str(getattr(w, "wall", "north") or "north").lower(),
+                lo, lo + float(getattr(w, "width", 1.0) or 1.0),
+                float(getattr(w, "sill", 0.9) or 0.0),
+            ))
+        return tuple(out)
+
+    def _update_runoff(self, frames: int) -> None:
+        """Fill/drain the roof store and voice every drip that lets go."""
+        if not self.use_drips:
+            return
+        r = self.room
+        self._runoff.layout(float(r.width), float(r.depth), float(r.height), self._runoff_windows())
+        q = float(getattr(r, "droplet_density", 0.5) or 0.0)
+        dt = frames / float(self.samplerate)
+        rain = quantity_to_rain_rate(q)
+        self._runoff.update(dt, rain)
+        mix_k = max(0.0, min(2.5, float(getattr(r, "mix_drips", 1.0))))
+        if mix_k <= 0.01:
+            return
+        # Heavy rain buries the drips; voice fewer of them (each is a full render)
+        keep = 1.0 / (1.0 + rain / 5.0)
+        for spot, t in self._runoff.drips(dt):
+            if keep < 1.0 and float(self._rng.rand()) > keep:
+                continue
+            self._spawn_drip(spot, int(t * self.samplerate), mix_k)
+
+    def _drip_amp(self, d_mm: float, fall_m: float) -> float:
+        """Impact ∝ D²v², with v from the fall (eaves are below terminal speed)."""
+        v_t = float(terminal_velocity(d_mm))
+        v = min(v_t, math.sqrt(2.0 * 9.81 * max(0.05, fall_m)))
+        return float(impact_amp(d_mm)) * (v / max(1e-6, v_t)) ** 2
+
+    def _spawn_drip(self, spot: DripSpot, delay_n: int, mix_k: float) -> None:
+        if len(self._voices) >= self.max_voices:
+            return
+        try:
+            self._drop_bank.ensure_built()
+            mono = self._drop_bank.pick(
+                surface=spot.surface, size_mm=spot.size_mm,
+                sharpness=self._sharpness(), chain_n=1, rng=self._rng,
+            )
+        except Exception:
+            return
+        # Same spot, same drop: fixed pitch per spot, a little drift per drip
+        rate = (spot.pitch * self._size_rate(spot.size_mm) * self._tone_rate()
+                * math.exp(float(self._rng.uniform(-0.025, 0.025))))
+        if len(mono) > 32:
+            n_out = max(24, int(round(len(mono) / rate)))
+            xq = np.linspace(0.0, len(mono) - 1, n_out)
+            mono = np.interp(xq, np.arange(len(mono), dtype=np.float64), mono)
+        if spot.surface == "metal":
+            mono = self._short_grain(mono, ms=52.0, fade_ms=4.0)
+        layer = "sill" if spot.surface == "metal" else "ground"
+        amp = (
+            self._drip_amp(spot.size_mm, spot.fall_m)
+            * loudness_gain(_DRIP_REF_Q) * _DROP_LEVEL
+            * math.exp(float(self._rng.normal(0.0, 0.15)))
+            * self._master * (mix_k ** 0.85) * _LEVEL_TRIM * _DRIP_GAIN
+            * hm.surface_radiate(spot.surface)
+        )
+        self._evt_id += 1
+        fade_n = max(8, int(0.0025 * self.samplerate))
+        self._render_and_queue(mono * amp, (spot.x, spot.land_y + 0.02, spot.z), layer,
+                               schedule_delay_n=delay_n, fade_n=fade_n)
+
+    def _gutter_points(self) -> List[Tuple[float, float, float]]:
+        """Two downspouts on opposite corners."""
+        w, d = float(self.room.width), float(self.room.depth)
+        return [(-0.15, 0.05, -0.15), (w + 0.15, 0.05, d + 0.15)]
+
     # ----- dense texture (drops below the discrete split) -----
-    def _dense_surface(self, source: str) -> str:
-        if source == "roof":
-            return self._surface_for_layer("roof")
-        if source == "near":
-            return "glass"
-        return "water"
+    def _dense_sources(self) -> Dict[str, Tuple[str, Tuple[str, ...]]]:
+        """Dense texture streams: name → (surface, catchment layers it carries)."""
+        wall_s = hm.wall_material(self.room).surface
+        srcs: Dict[str, Tuple[str, Tuple[str, ...]]] = {
+            "roof": (hm.roof_material(self.room).surface, ("roof",)),
+            "ground": ("water", ("ground",)),
+        }
+        if wall_s == "glass":
+            srcs["facade"] = ("glass", ("wall", "window", "sill"))
+        else:
+            srcs["facade"] = (wall_s, ("wall",))
+            srcs["glass"] = ("glass", ("window", "sill"))
+        return srcs
 
     def _dense_kernel_key(self) -> tuple:
         q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
         hit_sharp = max(0.12, min(0.95, self._sharpness() + 0.06 * q))
         return (
-            self._dense_surface("roof"),
+            tuple(sorted((k, v[0]) for k, v in self._dense_sources().items())),
             _nearest(SHARP_BINS, hit_sharp),
             int(round(q * 10)),
+            _SIZE_PITCH_EXP,
+            round(self._tone_rate(), 3),
         )
 
     def _ensure_dense_kernels(self) -> None:
-        """Bank grains shaped exactly like a visual landing (see _spawn_visual_hit)."""
+        """Bank grains made with the same recipe as a single drop (_drop_grain)."""
         key = self._dense_kernel_key()
         if key == self._dense_kernel_id:
             return
         self._drop_bank.ensure_built()
-        _roof, sharp, q10 = key
-        q = q10 / 10.0
+        sources, sharp, _q10, _exp, tone = key
         vrng = np.random.RandomState(4111)
-        for source in _DENSE_SOURCES:
-            surface = self._dense_surface(source)
+        for source, surface in list(sources) + [("gutter", "water")]:
             grains = []
             for size in SIZE_BINS_MM:
                 bank = self._drop_bank.variants(surface, size, sharp) or [
                     self._drop_bank.pick(surface=surface, size_mm=size, sharpness=sharp, chain_n=1)
                 ]
-                for g in make_variants(bank, VARIANTS_PER_SIZE, vrng):
-                    if surface == "metal":
-                        g = self._short_grain(g, ms=52.0 - 8.0 * q, fade_ms=4.0) * (1.18 + 0.22 * q)
-                    else:
-                        g = self._short_grain(g, ms=26.0 + 4.0 * q, fade_ms=8.0) * 0.32
-                    grains.append(g)
+                for g in make_variants(bank, VARIANTS_PER_SIZE, vrng, self._size_rate(size) * tone):
+                    grains.append(self._shape_grain(g, surface) * hm.surface_radiate(surface))
             self._dense.set_kernels(source, SIZE_BINS_MM, grains)
-            self._dense_kernel_gain[source] = 1.18 + 0.22 * q if surface == "metal" else 0.32
+            self._dense_kernel_gain[source] = hm.surface_radiate(surface)
         self._dense_kernel_id = key
-        self._dense_cal_fp = None  # grains changed → recalibrate
 
-    def _dense_fingerprint(self, visual: bool) -> tuple:
+    def _dense_fingerprint(self, visual: bool = False) -> tuple:
         r = self.room
         L = r.listener
         spk = tuple(
@@ -1477,28 +1491,28 @@ class SpatialRainEngine:
         )
         wins = tuple(
             (str(getattr(w, "wall", "")), round(float(getattr(w, "offset", 0.0) or 0.0), 2),
-             round(float(getattr(w, "open", 0.0) or 0.0), 2))
+             round(float(getattr(w, "open", 0.0) or 0.0), 2), str(getattr(w, "open_style", "")))
             for w in (getattr(r, "windows", []) or [])
         )
         return (
-            bool(visual), self._dense_kernel_id,
-            round(float(r.width), 2), round(float(r.depth), 2), round(float(r.height), 2),
-            str(getattr(r, "roof_material", "")), str(getattr(r, "wall_material", "")),
+            self._dense_kernel_key()[:2], self._patch_key,
             round(float(L.x), 2), round(float(getattr(L, "y", 1.2)), 2), round(float(L.z), 2),
             round(float(getattr(L, "yaw", 0.0)), 2), spk, wins, self.render_listener_binaural,
         )
 
-    def _calibrate_dense(self, visual: bool) -> None:
-        """Measure each layer's average path gain to every speaker and ear.
+    def _cal_layers(self) -> List[str]:
+        present = {p.layer for p in self._patches()}
+        return [l for l in ("roof", "wall", "window", "sill", "ground") if l in present] + ["gutter"]
 
-        Runs the same coupling the discrete voices use (cheap taps for visual
-        landings, full portal render otherwise) on a probe grain at a handful
-        of landing spots, so the dense sheet sits level with discrete drops.
-        """
+    def _measure_layer(self, layer: str, part: Optional[int] = None) -> Dict[str, Dict[object, float]]:
+        """Mean energy gain of the full wall/window path and of the 3D view's
+        cheap taps, from probe drops on ``layer`` to every speaker and ear.
+        ``part`` measures one chunk of the probe spots only (raw sums + "n")."""
         sr = self.samplerate
         main_rng = self._rng
-        self._rng = np.random.RandomState(9173)
-        cal: Dict[str, Dict[object, float]] = {}
+        self._rng = np.random.RandomState(9173 + 31 * len(layer) + 7 * (part or 0))
+        full: Dict[object, float] = {}
+        cheap: Dict[object, float] = {}
         try:
             L = self.room.listener
             lis = ((float(L.x), float(getattr(L, "y", 1.2)), float(L.z)), float(getattr(L, "yaw", 0.0)))
@@ -1507,94 +1521,167 @@ class SpatialRainEngine:
                 for i, sp in enumerate(self.room.speakers)
                 if getattr(sp, "enabled", True)
             ]
-            for source, kind in _DENSE_SOURCES.items():
-                _sizes, grains = self._dense._kernels[source]
-                probe = np.asarray(grains[VARIANTS_PER_SIZE], dtype=np.float64) / max(1e-9, self._dense_kernel_gain[source])
-                e_in = float(np.sum(probe * probe)) + 1e-18
-                acc: Dict[object, float] = {}
-                n_pts = 8
-                for _ in range(n_pts):
-                    _layer, sx, sy, sz, _d = self._point_for_layer(source)
-                    st = None
-                    if visual:
-                        for i, sig, _p in self._cheap_taps_for_hit(probe, (sx, sy, sz), kind):
-                            acc[i] = acc.get(i, 0.0) + float(np.sum(sig * sig))
-                        if self.render_listener_binaural:
-                            dx, dy, dz = sx - lis[0][0], sy - lis[0][1], sz - lis[0][2]
-                            dist = max(0.25, math.sqrt(dx * dx + dy * dy + dz * dz))
-                            g = self._portal_gain_cheap(sx, sy, sz, kind)
-                            g *= distance_attenuation(dist, ref=0.6, rolloff=1.1)
-                            st = binaural(probe * g * 1.35, math.atan2(dx, dz) - lis[1],
-                                          math.asin(max(-1.0, min(1.0, dy / dist))),
-                                          distance=dist, sr=sr, quality="fast")
-                    else:
-                        spk_bufs, st, _portals = render_drop_to_receivers(
-                            self.room, probe, (sx, sy, sz), recvs, sr,
-                            listener=lis if self.render_listener_binaural else None,
-                            fast=True, binaural_quality="fast",
-                        )
-                        for i, sig in spk_bufs.items():
-                            acc[i] = acc.get(i, 0.0) + float(np.sum(sig * sig))
-                        if st is not None:
-                            st = st * 1.55
-                    if st is not None and st.size:
-                        acc["L"] = acc.get("L", 0.0) + float(np.sum(st[:, 0] ** 2))
-                        acc["R"] = acc.get("R", 0.0) + float(np.sum(st[:, 1] ** 2))
-                cal[source] = {k: math.sqrt(v / (n_pts * e_in)) for k, v in acc.items()}
+            surface = "water" if layer == "gutter" else self._surface_for_layer(layer)
+            probe = self._drop_grain(surface, 2.0, "roof" if layer == "roof" else layer, rng=self._rng)
+            e_in = float(np.sum(probe * probe)) + 1e-18
+            kind = _LAYER_KIND.get(layer, 1)
+            n = 0
+            ks = range(_CAL_POINTS) if part is None else range(part * _CAL_CHUNK, (part + 1) * _CAL_CHUNK)
+            for k in ks:
+                if layer == "gutter":
+                    pts = self._gutter_points()
+                    src = pts[k % len(pts)]
+                else:
+                    src = self._point_for_layer(layer)
+                    if src is None:
+                        break
+                n += 1
+                spk_bufs, st, _portals = render_drop_to_receivers(
+                    self.room, probe, src, recvs, sr,
+                    listener=lis if self.render_listener_binaural else None,
+                    fast=True, binaural_quality="fast",
+                )
+                for i, sig in spk_bufs.items():
+                    full[i] = full.get(i, 0.0) + float(np.sum(sig * sig))
+                if st is not None and st.size:
+                    st = st * _HP_PATH_GAIN
+                    full["L"] = full.get("L", 0.0) + float(np.sum(st[:, 0] ** 2))
+                    full["R"] = full.get("R", 0.0) + float(np.sum(st[:, 1] ** 2))
+                for i, sig, _p in self._cheap_taps_for_hit(probe, src, kind):
+                    cheap[i] = cheap.get(i, 0.0) + float(np.sum(sig * sig))
+                if self.render_listener_binaural:
+                    cb = self._cheap_binaural(probe, src, kind)
+                    if cb is not None:
+                        cheap["L"] = cheap.get("L", 0.0) + float(np.sum(cb[:, 0] ** 2))
+                        cheap["R"] = cheap.get("R", 0.0) + float(np.sum(cb[:, 1] ** 2))
+            if n == 0:
+                return {}
+            # Speaker gains swing with how close each probe lands to a speaker;
+            # the cheap gain is plain distance math, so average it over many
+            # spots ("wide") and scale by the full/cheap ratio of the probes.
+            wide: Dict[object, float] = {}
+            n_wide = 48 if part is not None else 96
+            for _ in range(n_wide):
+                src = self._gutter_points()[_ % 2] if layer == "gutter" else self._point_for_layer(layer)
+                for i, g, _d in self._cheap_spk_gains(src, kind):
+                    wide[i] = wide.get(i, 0.0) + g * g
+            if part is not None:
+                return {"full": {k: v / e_in for k, v in full.items()},
+                        "cheap": {k: v / e_in for k, v in cheap.items()},
+                        "wide": {k: v * n / n_wide for k, v in wide.items()}, "n": {"n": float(n)}}
+            norm = lambda acc: {k: math.sqrt(v / (n * e_in)) for k, v in acc.items()}
+            res = {"full": norm(full), "cheap": norm(cheap)}
+            res["wide"] = {k: math.sqrt(v / n_wide) for k, v in wide.items()}
+            return _wide_full(res)
         except Exception:
-            log.exception("dense texture calibration failed")
-            cal = {}
+            log.exception("path calibration failed (%s)", layer)
+            return {}
         finally:
             self._rng = main_rng
-        self._dense_cal = cal
+
+    def _calibrate_paths(self, all_now: bool = False) -> None:
+        """Keep the per-layer path calibration current. A change re-measures
+        one chunk of probe spots per block (~5 ms) so dragging a speaker never
+        stalls the audio; the very first calibration runs at once."""
+        fp = self._dense_fingerprint()
+        if fp != self._cal_fp and (self._time - self._cal_t) > 0.5:
+            self._cal_fp = fp
+            self._cal_t = self._time
+            n_parts = max(1, _CAL_POINTS // _CAL_CHUNK)
+            self._cal_pending = [(l, k) for l in self._cal_layers() for k in range(n_parts)]
+            self._cal_new = {}
+            all_now = all_now or not self._path_cal
+        while self._cal_pending:
+            layer, part = self._cal_pending.pop(0)
+            got = self._measure_layer(layer, part)
+            acc = self._cal_new.setdefault(layer, {"full": {}, "cheap": {}, "wide": {}, "n": {"n": 0.0}})
+            for side in ("full", "cheap", "wide"):
+                for k, v in got.get(side, {}).items():
+                    acc[side][k] = acc[side].get(k, 0.0) + v
+            acc["n"]["n"] += got.get("n", {}).get("n", 0.0)
+            if not all_now:
+                break
+        if not self._cal_pending and self._cal_new:
+            cal = {}
+            for layer, acc in self._cal_new.items():
+                n = acc["n"]["n"]
+                if n > 0:
+                    cal[layer] = _wide_full({side: {k: math.sqrt(v / n) for k, v in acc[side].items()}
+                                             for side in ("full", "cheap", "wide")})
+            self._path_cal = cal
+            self._cal_new = {}
+
+    def _source_gains(self, layers: Sequence[str], shares: Dict[str, float]) -> Dict[object, float]:
+        """Energy-weighted full-path gain of a dense stream over its layers."""
+        acc: Dict[object, float] = {}
+        tot = 0.0
+        for layer in layers:
+            w = shares.get(layer, 0.0) if layer != "gutter" else 1.0
+            full = (self._path_cal.get(layer) or {}).get("full", {})
+            if w <= 0.0 or not full:
+                continue
+            tot += w
+            for k, g in full.items():
+                acc[k] = acc.get(k, 0.0) + w * g * g
+        return {k: math.sqrt(v / tot) for k, v in acc.items()} if tot > 0 else {}
 
     def _mix_dense(self, frames: int, mix: Dict[int, np.ndarray], visual: bool) -> None:
         """Add the dense drop texture to speakers, roof bus and the ears."""
         if not self.use_dense_texture or frames <= 0:
             return
+        self._dense.hit_makeup = _DENSE_HIT_MAKEUP
         q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
         _n, dist, split = self._rain_state()
         plan = {}
-        if dist is not None and split > D_MIN_MM:
+        gains: Dict[str, Dict[object, float]] = {}
+        g_flow = self._runoff.gutter_flow if self.use_drips else 0.0
+        mix_k = max(0.0, min(2.5, float(getattr(self.room, "mix_drips", 1.0))))
+        raining = dist is not None and split > D_MIN_MM
+        gutter = g_flow > 0.02 and mix_k > 0.01
+        if raining or gutter:
             self._ensure_dense_kernels()
-            fp = self._dense_fingerprint(visual)
-            stale = fp != self._dense_cal_fp and (self._time - self._dense_cal_t) > 0.5
-            if stale or self._dense_cal is None:
-                self._calibrate_dense(visual)
-                self._dense_cal_fp = fp
-                self._dense_cal_t = self._time
+            self._calibrate_paths()
+        if gutter:
+            # Spill out of the downspouts: small splashes, short fall
+            n_spouts = len(self._gutter_points())
+            rate = _GUTTER_MAX_RATE * n_spouts * (1.0 - math.exp(-g_flow / _GUTTER_HALF_FLOW))
+            _r, g_dist = dsd_for_quantity(0.5)
+            k = (loudness_gain(_DRIP_REF_Q) * _DROP_LEVEL * self._master * (mix_k ** 0.85)
+                 * _GUTTER_GAIN * _LEVEL_TRIM / self._dense_kernel_gain["gutter"])
+            plan["gutter"] = (rate, g_dist, 0.6, 2.5, k)
+            gains["gutter"] = self._source_gains(("gutter",), {})
+        if raining:
             mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
-            sharp = self._sharpness()
             # Drizzle: keep the sheet ~6 dB under the ticks; physical by moderate rain.
             trim = 10.0 ** (-6.0 * (1.0 - min(1.0, q / 0.5)) / 20.0)
-            base = loudness_gain(q) * _DROP_LEVEL * self._master * (mix_d ** 0.85) * trim
-            total = dist.flux(D_MIN_MM, split) * self._rain_area() * (1.0 + 0.10 * self._wind_speed())
-            probs = self._layer_probs()
-            share = {"roof": probs["roof"], "near": probs["near"], "yard": probs["yard"] + probs["wall"]}
-            for source in _DENSE_SOURCES:
-                rate = total * share[source]
-                if rate <= 0.0:
+            k = (loudness_gain(q) * _DROP_LEVEL * self._master * (mix_d ** 0.85) * trim
+                 * (0.70 + 0.22 * self._sharpness()) * _LEVEL_TRIM)
+            total = dist.flux(D_MIN_MM, split) * self._rain_area()
+            shares = self._layer_probs()
+            streams = []
+            for source, (_surface, layers) in self._dense_sources().items():
+                share = sum(shares.get(l, 0.0) for l in layers)
+                g = self._source_gains(layers, shares)
+                loud = share * (self._dense_kernel_gain.get(source, 0.3) ** 2) * sum(v * v for v in g.values())
+                streams.append((loud, source, share, g))
+            top = max((s[0] for s in streams), default=0.0)
+            for loud, source, share, g in streams:
+                # Streams 30 dB under the loudest are masked by it; don't render them
+                if share <= 0.0 or not g or loud < 1e-3 * top:
                     continue
-                if visual:
-                    k = base * (0.70 + 0.22 * sharp)
-                else:
-                    surface = self._dense_surface(source)
-                    k = (
-                        base * _EVENT_PATH_TRIM * self._event_layer_gain(source, surface)
-                        / self._dense_kernel_gain[source]
-                    )
-                plan[source] = (rate, dist, D_MIN_MM, split, k)
+                plan[source] = (total * share, dist, D_MIN_MM, split, k)
+                gains[source] = g
         n_on = sum(1 for sp in self.room.speakers if getattr(sp, "enabled", True))
         self._dense.set_stems(min(4, max(2, n_on)))
         stems = self._dense.render(frames, plan)
         if not stems:
             return
-        cal = self._dense_cal or {}
         n_st = self._dense.n_stems
         for source, st in stems.items():
-            gains = cal.get(source, {})
+            g_src = gains.get(source) or self._last_dense_gains.get(source, {})
+            self._last_dense_gains[source] = g_src
             for i, sp in enumerate(self.room.speakers):
-                g = gains.get(i, 0.0)
+                g = g_src.get(i, 0.0)
                 if g <= 0.0 or not getattr(sp, "enabled", True):
                     continue
                 buf = st[i % n_st] * g
@@ -1604,7 +1691,7 @@ class SpatialRainEngine:
                 rb = st[0] * 0.144
                 mix[rid] = mix[rid] + rb if rid in mix else rb
             if self._last_binaural is not None and self._last_binaural.shape[0] == frames:
-                gl, gr = gains.get("L", 0.0), gains.get("R", 0.0)
+                gl, gr = g_src.get("L", 0.0), g_src.get("R", 0.0)
                 if gl > 0.0 or gr > 0.0:
                     self._last_binaural[:, 0] += st[0] * gl
                     self._last_binaural[:, 1] += st[1 % n_st] * gr
@@ -1666,6 +1753,15 @@ class SpatialRainEngine:
         for rev in self._reverb_mono.values():
             rev.set_params(room_size=size, damping=damp, wet=wet * 0.85)
 
+    def _field_energy_k(self, q: float) -> float:
+        """Amplitude of the rain field at ``q`` relative to 35%: √energy × the
+        per-drop loudness compression (what the drops themselves follow)."""
+        if q <= 0.0005:
+            return 0.0
+        _r, dist = dsd_for_quantity(q)
+        _r0, dist0 = dsd_for_quantity(0.35)
+        return math.sqrt(dist.energy() / max(1e-18, dist0.energy())) * loudness_gain(q) / loudness_gain(0.35)
+
     def _mix_outdoor_field(self, frames: int, mix: Dict[int, np.ndarray]) -> None:
         """Add multi-depth outdoor field (procedural ± WAV) through window portals."""
         if not self.use_outdoor_field or frames <= 0:
@@ -1683,11 +1779,13 @@ class SpatialRainEngine:
         if mix_w <= 0.001:
             field_level = 0.0
         else:
-            # Quantity should add *taps*, not a louder brown blanket.
-            mass = 0.010 + 0.022 * q
-            roof_mat = str(getattr(self.room, "roof_material", "") or "").lower()
-            if "tin" in roof_mat or "metal" in roof_mat:
-                mass *= 0.70 - 0.28 * q
+            # The far field is the same rain as the drops: its level follows
+            # the rain's energy under the same loudness compression, anchored
+            # at 35% to the old hand curve (0.0177; ×0.602 under a metal roof,
+            # which masks it).
+            mass = 0.0177 * self._field_energy_k(q)
+            if hm.roof_material(self.room).surface == "metal":
+                mass *= 0.602
             fader = 0.45 + 0.55 * min(1.2, mix_w)
             field_level = mass * float(self._master) * fader
         wt = _wall_tone(getattr(self.room, "wall_material", None))
@@ -1792,6 +1890,7 @@ class SpatialRainEngine:
             self._visual_rate = inst if self._visual_rate <= 0.0 else self._visual_rate + a * (inst - self._visual_rate)
         else:
             self._visual_rate = 0.0
+        self._calibrate_paths()
         if visual:
             # The view hands over a block's landings at once. Starting them all
             # on sample 0 put the loudest drops on a 23 Hz grid (a drum roll);
@@ -1815,6 +1914,7 @@ class SpatialRainEngine:
                 self._next_event += max(gap, 1.0 / sr)
             if vips <= 0:
                 self._next_event = t1 + 1.0
+        self._update_runoff(frames)
         self._time = t1
 
         mix = self._mix_speakers(frames)
@@ -1895,7 +1995,8 @@ class SpatialRainEngine:
         self._rng = np.random.RandomState(seed)
         self._wind_air = WindAirSynth(sr=self.samplerate, seed=4242 + seed)
         self._dense.reset(777 + seed)
-        self._dense_cal_t = -1e9
+        self._cal_t = -1e9
+        self._runoff.reset(31 + seed)
         self._field = OutdoorFieldBed(sr=self.samplerate, seed=2024 + seed)
         self._field_router = OutdoorFieldRouter(sr=self.samplerate)
         self._reverb_mono = {}

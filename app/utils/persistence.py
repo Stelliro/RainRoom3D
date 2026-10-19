@@ -13,6 +13,7 @@ from app.models.room import (
     MIX_REVERB_RECOMMENDED,
     MIX_WASH_RECOMMENDED,
     MIX_WIND_RECOMMENDED,
+    MIX_DRIPS_RECOMMENDED,
     TONE_PITCH_RECOMMENDED,
     TONE_RING_RECOMMENDED,
     TONE_SOFT_RECOMMENDED,
@@ -148,6 +149,9 @@ def load_room(path: str) -> Room:
         mix_wind=float(
             rain.get("mix_wind", data.get("mix", {}).get("wind", MIX_WIND_RECOMMENDED))
         ),
+        mix_drips=float(
+            rain.get("mix_drips", data.get("mix", {}).get("drips", MIX_DRIPS_RECOMMENDED))
+        ),
         tone_pitch=float(
             rain.get(
                 "tone_pitch",
@@ -274,6 +278,7 @@ def save_room(room: Room, path: str) -> None:
             "mix_droplets": float(getattr(room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)),
             "mix_reverb": float(getattr(room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
             "mix_wind": float(getattr(room, "mix_wind", MIX_WIND_RECOMMENDED)),
+            "mix_drips": float(getattr(room, "mix_drips", MIX_DRIPS_RECOMMENDED)),
             "tone_pitch": float(getattr(room, "tone_pitch", TONE_PITCH_RECOMMENDED)),
             "tone_ring": float(getattr(room, "tone_ring", TONE_RING_RECOMMENDED)),
             "tone_wet": float(getattr(room, "tone_wet", TONE_WET_RECOMMENDED)),
@@ -287,6 +292,7 @@ def save_room(room: Room, path: str) -> None:
             "droplets": float(getattr(room, "mix_droplets", MIX_DROPLETS_RECOMMENDED)),
             "reverb": float(getattr(room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
             "wind": float(getattr(room, "mix_wind", MIX_WIND_RECOMMENDED)),
+            "drips": float(getattr(room, "mix_drips", MIX_DRIPS_RECOMMENDED)),
             "master": float(getattr(room, "master_volume", 0.75)),
             "quantity": float(getattr(room, "droplet_density", 0.55)),
             "sharpness": float(getattr(room, "rain_intensity", 0.35)),

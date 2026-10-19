@@ -16,6 +16,7 @@ ears fed different stems hear a diffuse sheet, not a phantom centre.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -55,12 +56,15 @@ VARIANTS_PER_SIZE = 6
 _VARIANT_SPREAD = 0.11  # ± playback-rate range across variants (log)
 
 
-def make_variants(grains: Sequence[np.ndarray], n: int, rng: np.random.RandomState) -> List[np.ndarray]:
-    """n resampled variants cycling through ``grains``, spread evenly in pitch."""
+def make_variants(
+    grains: Sequence[np.ndarray], n: int, rng: np.random.RandomState, base_rate: float = 1.0
+) -> List[np.ndarray]:
+    """n resampled variants cycling through ``grains``, spread evenly in pitch
+    around ``base_rate``."""
     src = [np.asarray(g, dtype=np.float64).reshape(-1) for g in grains if len(g)]
     if not src:
         return []
-    rates = np.exp(np.linspace(-_VARIANT_SPREAD, _VARIANT_SPREAD, max(1, n)))
+    rates = float(base_rate) * np.exp(np.linspace(-_VARIANT_SPREAD, _VARIANT_SPREAD, max(1, n)))
     rng.shuffle(rates)
     out = []
     for i, rate in enumerate(rates):
@@ -87,7 +91,11 @@ class DenseRainTexture:
         self.sr = int(sr)
         self.n_stems = max(1, int(n_stems))
         self.max_grains_per_sec = float(max_grains_per_sec)
+        # Above the cap, the share of the missing grains' energy put back as
+        # louder grains (1) or as a continuous roar of the same grains (0).
+        self.hit_makeup = 1.0
         self.rng = np.random.RandomState(int(seed) & 0x7FFFFFFF)
+        self._bed_rng = np.random.default_rng(int(seed) + 1)
         # source → (sizes_mm[S], kernels[S * V]) — V variants per size, bin-major
         self._kernels: Dict[str, Tuple[np.ndarray, List[np.ndarray]]] = {}
         self._kfft: Dict[Tuple[str, int], Tuple[int, np.ndarray]] = {}
@@ -190,8 +198,11 @@ class DenseRainTexture:
         # Grain cap per source per stem
         cap = self.max_grains_per_sec * frames / float(self.sr)
         thin = 1.0
+        bed = 0.0  # drops/sample carried by the roar instead of grains
         if cap > 0.0 and lam > cap:
-            thin = (lam / cap) ** 0.5  # same energy, fewer separable grains
+            m = max(0.0, min(1.0, float(self.hit_makeup)))
+            thin = (1.0 + m * (lam / cap - 1.0)) ** 0.5
+            bed = (1.0 - m) * (lam - cap) / float(frames)
             lam = cap
         rng = self.rng
         stems = np.zeros((self.n_stems, frames), dtype=np.float64)
@@ -209,6 +220,18 @@ class DenseRainTexture:
                 ki = ki * n_var + rng.randint(0, n_var, n)
                 pos = rng.randint(0, frames, n)
                 np.add.at(imp[s], (ki, pos), a)
+        if bed > 0.0:
+            # Infinitely dense shot noise is Gaussian with the grains' spectrum:
+            # white noise in every kernel row, scaled to that size bin's energy.
+            probe = dist.sample(512, rng, d_lo, d_hi)
+            e_a = (impact_amp(probe) * amp_scale) ** 2 * math.exp(2.0 * 0.45 ** 2)
+            bins = np.abs(np.log(probe)[:, None] - log_sizes[None, :]).argmin(axis=1)
+            per_bin = np.bincount(bins, weights=e_a, minlength=len(sizes)) / len(probe)
+            sd = np.sqrt(bed * np.repeat(per_bin, n_var) / n_var)
+            # Only the size bins that carry the energy (≥1% of the top bin)
+            rows = np.flatnonzero(np.repeat(per_bin >= 0.01 * per_bin.max(), n_var))
+            noise = self._bed_rng.standard_normal((self.n_stems, len(rows), frames), dtype=np.float32)
+            imp[:, rows] += noise * sd[rows][None, :, None]
         used = np.flatnonzero(imp.any(axis=(0, 2)))
         ys = None
         if len(used):

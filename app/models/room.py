@@ -21,6 +21,7 @@ MIX_WASH_RECOMMENDED = 0.05
 MIX_DROPLETS_RECOMMENDED = 2.0
 MIX_REVERB_RECOMMENDED = 1.0
 MIX_WIND_RECOMMENDED = 1.0
+MIX_DRIPS_RECOMMENDED = 1.0
 
 # Drop-tone lab (0..1). 0.5 ≈ neutral / current engine default character.
 # Plain-language “what each hit sounds like” — not music theory.
@@ -284,6 +285,7 @@ class Room:
     mix_droplets: float = MIX_DROPLETS_RECOMMENDED
     mix_reverb: float = MIX_REVERB_RECOMMENDED
     mix_wind: float = MIX_WIND_RECOMMENDED
+    mix_drips: float = MIX_DRIPS_RECOMMENDED  # eave drips + gutter trickle
 
     # --- Drop tone lab (0..1; saved with the house; live while rain plays) ---
     tone_pitch: float = TONE_PITCH_RECOMMENDED

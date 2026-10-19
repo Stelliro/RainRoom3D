@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import math
-import random
 import time
 
 import numpy as np
@@ -75,7 +74,7 @@ class GLRoomView(QOpenGLWidget):
         self.roof_type = "Flat"
         # Visual rain is independent of audio droplets. Batched GL lines are
         # cheap; keep a dense field without 1:1 Python glVertex calls.
-        self._rain = np.zeros((0, 5), dtype=np.float32)  # x y z vy kind
+        self._rain = np.zeros((0, 6), dtype=np.float32)  # x y z vy kind land_y
         self._rain_verts = np.zeros((0, 3), dtype=np.float32)
         self._splashes = []
         self._max_particles = 2400
@@ -705,94 +704,49 @@ class GLRoomView(QOpenGLWidget):
         return max(24, min(self._max_particles, n))
 
     def _spawn_world_rain(self, count: int) -> np.ndarray:
-        """Rain over the room footprint plus a thin eaves ring (not the whole terrain)."""
+        """Rain on the house, spread by the same catchments the audio uses
+        (house_model): roof by its area, walls/windows by wind tilt, sills and
+        the ground ring flat. Each streak lands at its surface (column 5)."""
         if not self.room or count <= 0:
-            return np.zeros((0, 5), dtype=np.float32)
+            return np.zeros((0, 6), dtype=np.float32)
+        from app.audio import house_model as hm
+
         w, h, d = float(self.room.width), float(self.room.height), float(self.room.depth)
         half_w, half_d = w * 0.5, d * 0.5
         n = int(count)
-        out = np.empty((n, 5), dtype=np.float32)
-        u = np.random.random(n)
-        roof_mat = str(getattr(self.room, "roof_material", "") or "").lower()
-        tin_roof = ("tin" in roof_mat) or ("metal" in roof_mat)
-        # Quantity is for the house, not a 40 m field. A little overshoot = gutters / drip line.
-        p_roof = 0.88 if tin_roof else 0.78
+        out = np.empty((n, 6), dtype=np.float32)
+        patches = hm.catchments(
+            self.room,
+            float(getattr(self.room, "wind_speed", 0.0) or 0.0),
+            float(getattr(self.room, "wind_direction_deg", 90.0) or 0.0),
+        )
         dens = max(0.0, min(1.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0)))
         y_span = 3.8 - 1.1 * dens
-        eaves = 0.85
+        rng = np.random
         for i in range(n):
-            if u[i] < p_roof:
-                x = float(np.random.uniform(-half_w, half_w))
-                z = float(np.random.uniform(-half_d, half_d))
-                y0 = h + float(np.random.uniform(0.35, max(0.8, y_span)))
-                kind = 3.0
-            else:
-                dist = float(np.random.uniform(0.12, eaves))
-                per = 2.0 * ((w + 2.0 * dist) + (d + 2.0 * dist))
-                t = float(np.random.uniform(0.0, per))
-                pw = w + 2.0 * dist
-                pd = d + 2.0 * dist
-                if t < pw:
-                    x, z = t - dist - half_w, half_d + dist
-                else:
-                    t -= pw
-                    if t < pd:
-                        x, z = half_w + dist, t - dist - half_d
-                    else:
-                        t -= pd
-                        if t < pw:
-                            x, z = half_w + dist - t, -half_d - dist
-                        else:
-                            t -= pw
-                            x, z = -half_w - dist, half_d + dist - t
-                y0 = float(np.random.uniform(h * 0.35, h + y_span))
-                kind = 1.0
-            vy = float(np.random.uniform(-(3.2 + 1.6 * dens), -(5.4 + 2.4 * dens)))
-            out[i] = (x, y0, z, vy, kind)
+            patch = hm.pick_patch(patches, rng)
+            if patch is None:
+                out[i] = (0.0, h + 1.0, 0.0, -5.0, 3.0, h + 0.02)
+                continue
+            x, land_y, z = hm.sample_point(self.room, patch, rng)
+            if patch.kind == 3:
+                y0 = h + float(rng.uniform(0.35, max(0.8, y_span)))
+                land_y = h + 0.02
+            elif patch.kind == 1:
+                y0 = float(rng.uniform(h * 0.35, h + y_span))
+                land_y = 0.0
+            else:  # wall / window / sill: streak down the facade to its spot
+                y0 = float(land_y) + float(rng.uniform(0.4, 1.6))
+            vy = float(rng.uniform(-(3.2 + 1.6 * dens), -(5.4 + 2.4 * dens)))
+            out[i] = (x - half_w, y0, z - half_d, vy, float(patch.kind), land_y)
         return out
 
-    def _spawn_window_ingress(self) -> np.ndarray:
-        if not self.room:
-            return np.zeros((0, 5), dtype=np.float32)
-        w, d = float(self.room.width), float(self.room.depth)
-        rows = []
-        for win in self.room.windows:
-            if float(getattr(win, "open", 0.0)) <= 0.05:
-                continue
-            try:
-                if hasattr(self.room, "window_exterior_point"):
-                    ex, ey, ez = self.room.window_exterior_point(win, out_dist=0.25)
-                    cx, cy, cz = ex - w * 0.5, ey, ez - d * 0.5
-                else:
-                    cx = win.x - w * 0.5
-                    cz = win.z - d * 0.5
-                    cy = float(getattr(win, "sill", 0.9)) + 0.4
-            except Exception:
-                continue
-            n = max(1, int(3 * float(getattr(win, "open", 0.5))))
-            for _ in range(n):
-                rows.append((
-                    cx + random.uniform(-0.25, 0.25),
-                    random.uniform(max(0.2, cy - 0.35), cy + 0.35),
-                    cz + random.uniform(-0.25, 0.25),
-                    random.uniform(-2.5, -3.5),
-                    2.0,
-                ))
-        if not rows:
-            return np.zeros((0, 5), dtype=np.float32)
-        return np.asarray(rows, dtype=np.float32)
-
     def _init_particles(self):
-        self._rain = np.zeros((0, 5), dtype=np.float32)
+        self._rain = np.zeros((0, 6), dtype=np.float32)
         self._rain_verts = np.zeros((0, 3), dtype=np.float32)
         if not self.room:
             return
-        world = self._spawn_world_rain(self._visual_target())
-        win = self._spawn_window_ingress()
-        if win.shape[0]:
-            self._rain = np.vstack([world, win])
-        else:
-            self._rain = world
+        self._rain = self._spawn_world_rain(self._visual_target())
 
     def _tick(self):
         if not self.room or not self.isVisible():
@@ -800,25 +754,25 @@ class GLRoomView(QOpenGLWidget):
         dens = max(0.0, float(getattr(self.room, "droplet_density", 0.5) or 0.0))
         if dens <= 0.0005:
             if self._rain.shape[0]:
-                self._rain = np.zeros((0, 5), dtype=np.float32)
+                self._rain = np.zeros((0, 6), dtype=np.float32)
                 self.update()
             return
         wx, wz = self._wind_push()
         wx *= 2.2
         wz *= 2.2
         dt = 0.033
-        h = float(self.room.height)
         if self._rain.shape[0] == 0:
             self._init_particles()
         r = self._rain
         if r.shape[0] == 0:
             self.update()
             return
-        r[:, 0] += wx * dt
+        # Wind drifts falling rain; facade streaks stay on their wall
+        free = (r[:, 4] == 1.0) | (r[:, 4] == 3.0)
+        r[free, 0] += wx * dt
         r[:, 1] += r[:, 3] * dt
-        r[:, 2] += wz * dt
-        ground = np.where(r[:, 4] == 3.0, h + 0.02, 0.0)
-        dead = r[:, 1] <= ground
+        r[free, 2] += wz * dt
+        dead = r[:, 1] <= r[:, 5]
         n_dead = int(np.count_nonzero(dead))
         if n_dead:
             hits = r[dead]
@@ -829,7 +783,7 @@ class GLRoomView(QOpenGLWidget):
                 for i in range(hits.shape[0]):
                     payload.append((
                         float(hits[i, 0]) + hw,
-                        float(hits[i, 1]),
+                        float(hits[i, 5]),
                         float(hits[i, 2]) + hd,
                         int(hits[i, 4]),
                     ))
@@ -850,12 +804,6 @@ class GLRoomView(QOpenGLWidget):
             r = np.vstack([r, extra]) if extra.shape[0] else r
         elif n > self._max_particles:
             r = r[: self._max_particles]
-        if random.random() < 0.06:
-            acc = self._spawn_window_ingress()
-            if acc.shape[0]:
-                r = np.vstack([r, acc])
-                if r.shape[0] > self._max_particles:
-                    r = r[: self._max_particles]
         self._rain = r
         self.update()
 

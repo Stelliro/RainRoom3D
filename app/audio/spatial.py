@@ -13,6 +13,12 @@ Sound model
 
 Closed window  → quiet, dark leakage  
 Open window    → loud, clear path from that wall into the room  
+
+Construction paths (house_model.MATERIALS):
+5. A drop **on** the roof or a wall shakes that panel: it radiates into the
+   room scaled by the material's ``impact`` and muffled to its ``lp_hz``.
+6. Rain on the ground just outside comes **through** the closed wall or
+   glass by its ``airborne`` transmission (glass >> wood >> brick).
 """
 
 from __future__ import annotations
@@ -558,17 +564,61 @@ def _roof_body(
     src: Vec3,
     sr: int,
 ) -> Optional[Tuple[np.ndarray, Vec3]]:
-    """Filter a roof hit once; None if the source is not on the roof plane."""
+    """Filter a roof hit once; None if the source is not on the roof plane.
+
+    Tin is the reference (impact 1.0, 5.6 kHz); tile and shingle over an
+    attic come through far quieter and darker."""
+    from app.audio import house_model as hm
+
     sx, sy, sz = src
     h = float(getattr(room, "height", 2.6))
     if sy < h - 0.2:
         return None
     rx = max(0.0, min(float(room.width), sx))
     rz = max(0.0, min(float(room.depth), sz))
-    roof_name = str(getattr(room, "roof_material", "") or "").lower()
-    fc = 5600.0 if ("tin" in roof_name or "metal" in roof_name) else 1450.0
-    body = one_pole_lp(np.asarray(mono, dtype=np.float64).reshape(-1), fc, sr)
+    mat = hm.roof_material(room)
+    body = one_pole_lp(np.asarray(mono, dtype=np.float64).reshape(-1), mat.lp_hz, sr) * mat.impact
     return body, (rx, h, rz)
+
+
+# Panel paths start from the wall's inside face; drops beyond this are the
+# far field (the outdoor wash bed carries them).
+WALL_REACH_M = 1.5
+WALL_CONTACT_M = 0.08
+
+
+def _wall_body(
+    room,
+    mono: np.ndarray,
+    src: Vec3,
+    sr: int,
+) -> Optional[Tuple[np.ndarray, Vec3]]:
+    """A drop on (or just outside) a wall → that wall's inside face.
+
+    On the facade it shakes the panel (wall or window glass ``impact``);
+    farther out, on the ground, it comes through by ``airborne``. Open
+    windows are portals (couple_outdoor_to_windows), so a drop on an open
+    pane loses the part of the glass that isn't there.
+    """
+    from app.audio import house_model as hm
+
+    hit = hm.wall_contact(room, src, reach=WALL_REACH_M)
+    if hit is None:
+        return None
+    wall, dist, u, win = hit
+    mat = hm.material("glass") if win is not None else hm.wall_material(room)
+    if dist <= WALL_CONTACT_M:
+        g = mat.impact
+    else:
+        g = mat.airborne * distance_attenuation(dist, ref=0.35, rolloff=1.0)
+    if win is not None:
+        g *= 1.0 - 0.8 * max(0.0, min(1.0, float(getattr(win, "open", 0.0) or 0.0)))
+    if g < 1e-5:
+        return None
+    h = float(getattr(room, "height", 2.6))
+    y = max(0.25, min(h - 0.25, float(src[1]) + 0.3))
+    body = one_pole_lp(np.asarray(mono, dtype=np.float64).reshape(-1), mat.lp_hz, sr) * g
+    return body, hm.wall_point(room, wall, u, y, out=-0.05)
 
 
 def _roof_to_recv(
@@ -637,15 +687,17 @@ def render_drop_to_receivers(
     """
     portals = couple_outdoor_to_windows(room, mono, src, sr, fast=fast)
     roof = _roof_body(room, mono, src, sr)
+    panel = _wall_body(room, mono, src, sr) if roof is None else None
     indoor_lp = not bool(fast)
     out: Dict[int, np.ndarray] = {}
     for idx, recv, gscale in receivers:
         acc = radiate_portals_to_receiver_mono(
             portals, recv, sr, gscale, indoor_lp=indoor_lp
         )
-        if roof is not None:
-            body, rpos = roof
-            acc = _sum_mono(acc, _roof_to_recv(body, rpos, recv, sr, gscale * 0.8))
+        for body_pos in (roof, panel):
+            if body_pos is not None:
+                body, rpos = body_pos
+                acc = _sum_mono(acc, _roof_to_recv(body, rpos, recv, sr, gscale * 0.8))
         out[int(idx)] = acc
 
     stereo = None
@@ -656,11 +708,12 @@ def render_drop_to_receivers(
                 p, lpos, sr, gain_scale=1.0
             ) if not fast else None
             if fast:
-                # Cheap indoor: delay+gain, then fast HRTF
+                # Cheap indoor: delay+gain, then fast HRTF (same level law as
+                # indoor_arrival_from_portal, minus its filter)
                 ap = p.aperture
                 d_in = max(0.12, _len(_sub(lpos, ap)))
                 att_in = distance_attenuation(d_in, ref=0.45, rolloff=1.15)
-                near = 1.0 + 0.25 * math.exp(-d_in * 2.2)
+                near = 1.0 + 1.4 * math.exp(-d_in * 1.8)
                 g = float(att_in * near)
                 if g < 1e-6:
                     continue
@@ -691,6 +744,14 @@ def render_drop_to_receivers(
             aim = (lpos[0], float(getattr(room, "height", 2.6)), lpos[2])
             az, el = azimuth_elevation(lpos, aim, yaw=yaw)
             bi = binaural(rs, az, el, distance=1.2, sr=sr, quality=binaural_quality)
+            stereo = bi if stereo is None else _sum_stereo(stereo, bi)
+        if panel is not None:
+            body, wpos = panel
+            ws = _roof_to_recv(body, wpos, lpos, sr, 0.7)
+            az, el = azimuth_elevation(lpos, wpos, yaw=yaw)
+            d_w = max(0.35, _len(_sub(lpos, wpos)))
+            # Panel paths are muffled below ~4 kHz: the fast HRTF is enough
+            bi = binaural(ws, az, el, distance=d_w, sr=sr, quality="fast")
             stereo = bi if stereo is None else _sum_stereo(stereo, bi)
         if stereo is None:
             stereo = np.zeros((4, 2), dtype=np.float64)
