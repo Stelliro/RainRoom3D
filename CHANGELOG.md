@@ -3,6 +3,16 @@
 All notable changes to RainRoom3D. Versions follow [Semantic Versioning](https://semver.org/):
 from 1.0 on, point releases (1.0.x, 1.x) bring fixes, sound tuning and small features.
 
+## [Unreleased]
+
+### Changed
+- The repository has a **[codebase index](docs/CODEBASE.md)**: a map of every module, how the sound engine fits together, where files are kept and how to test and release.
+- A tidier `.gitignore`. Personal data (your room, presets and phone settings), build output and local working notes are never published.
+- `app/tools/him_quantity_probe.py` is now `app/tools/quantity_probe.py`.
+
+### Removed
+- `HIM_CODEX.md`, a development log, from the repository. The codebase index replaces it.
+
 ## [1.0.0] — 2026-10-22
 
 The first full release. It brings a new app, a physical rain model, wind,
@@ -117,6 +127,7 @@ The first public work-in-progress release.
 - A default Living Room layout.
 - Licensed under the PolyForm Noncommercial 1.0.0 license.
 
+[Unreleased]: https://github.com/Stelliro/RainRoom3D/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/Stelliro/RainRoom3D/releases/tag/v1.0.0
 [0.2.0-wip]: https://github.com/Stelliro/RainRoom3D/releases/tag/v0.2.0-wip
 [0.1.2-wip]: https://github.com/Stelliro/RainRoom3D/releases/tag/v0.1.2-wip

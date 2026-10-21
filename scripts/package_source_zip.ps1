@@ -13,7 +13,7 @@ if (Test-Path $Zip) { Remove-Item $Zip -Force }
 $Exclude = @(
     ".git", ".venv", "venv", "dist", "build", "out", "logs",
     "__pycache__", ".idea", ".vscode", ".pytest_cache", ".mypy_cache",
-    "node_modules", "backups"
+    "node_modules", "backups", ".claude"
 )
 $Temp = Join-Path $env:TEMP "RainRoom3D_src_pack"
 if (Test-Path $Temp) { Remove-Item $Temp -Recurse -Force }
@@ -25,7 +25,7 @@ $Exclude += (Join-Path $Root "configs\zones")
 foreach ($kind in @("house", "mix", "weather")) { $Exclude += (Join-Path $Root "configs\presets\$kind") }
 
 # Exclude build artifacts / caches; keep app source lean for Releases
-robocopy $Root $Temp /E /XD $Exclude /XF "*.pyc" "*.log" "*.spec" "*.zip" "remote.json" "my_house*.json" "RELEASE_v*-wip.md" /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+robocopy $Root $Temp /E /XD $Exclude /XF "*.pyc" "*.log" "*.spec" "*.zip" "remote.json" "my_house*.json" "RELEASE_v*-wip.md" "HIM_CODEX*.md" "*.tmp" "*.bak" /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
 Compress-Archive -Path (Join-Path $Temp "*") -DestinationPath $Zip -Force
 Remove-Item $Temp -Recurse -Force
 Write-Host "Wrote $Zip"

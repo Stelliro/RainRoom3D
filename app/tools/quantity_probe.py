@@ -1,4 +1,7 @@
-"""HIM probe: quantity → audible level (drizzle silence)."""
+"""Probe: rain Amount (quantity) → audible level, speakers and headphones.
+
+    python -m app.tools.quantity_probe
+"""
 from __future__ import annotations
 
 import numpy as np

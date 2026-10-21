@@ -118,6 +118,9 @@ Your room is kept in `configs/my_house.json` and your presets in
 
 ## Project layout
 
+For what each module does and how the sound engine fits together, see the
+**[codebase index](docs/CODEBASE.md)**.
+
 ```text
 app/
   audio/       the sound: rain, house model, wind, thunder, spatial rendering
@@ -128,7 +131,7 @@ app/
   tools/       test suites and helper scripts
 assets/        rain samples and the app icon
 configs/       the default house and the example houses
-docs/media/    README screenshots
+docs/          the codebase index and README screenshots
 scripts/       release build, source zip, screenshots, sample generation
 ```
 
