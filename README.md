@@ -1,66 +1,102 @@
 # RainRoom3D
 
-**Design your room on a terrain map, place real speakers, and hear outdoor rain come through your windows in 3D.**
+**Build your room, open the windows, and hear the rain outside — in 3D, on headphones or on your real speakers.**
 
+[![Release](https://img.shields.io/github/v/release/Stelliro/RainRoom3D?label=release)](https://github.com/Stelliro/RainRoom3D/releases/latest)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue.svg)](LICENSE)
-[![Status: WIP](https://img.shields.io/badge/status-WIP-orange.svg)](#status--work-in-progress)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#quick-start)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg)](#download)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-yellow.svg)](requirements.txt)
 
-| | |
-|---|---|
-| **Repo** | [github.com/Stelliro/RainRoom3D](https://github.com/Stelliro/RainRoom3D) |
-| **Default layout** | [`configs/my_house.json`](configs/my_house.json) (Living Room) |
-| **License** | [PolyForm Noncommercial 1.0.0](LICENSE) |
-
-> **Work in progress.** Spatial rain, multi-device routing, and the editor are actively evolving. Expect rough edges.
-
 <p align="center">
-  <img src="docs/media/hero_app.jpg" alt="RainRoom3D — Design house floor plan (actual app screenshot)" width="920" />
+  <img src="docs/media/hero_app.jpg" alt="RainRoom3D designing a living room: floor plan, window inspector and the Rain & sound panel" width="920" />
 </p>
 
+RainRoom3D simulates a rainstorm around a house you draw. Rain lands on the
+roof, the walls, the windows and the yard. What you hear depends on:
+
+- what the house is made of;
+- which windows are open, and how far;
+- where the wind comes from;
+- where you sit.
+
+The sound comes from a physical model, not a looped recording. A tin roof
+rattles, a brick house stays quiet, and opening a window lets the yard in.
+
+> **1.0 is the first full release.** RainRoom3D is still a work in progress at
+> heart. Expect small improvements and sound tuning in point releases from here.
+
+---
+
+## Download
+
+**Windows:**
+
+1. Download `RainRoom3D-<version>-windows-portable.zip` from the [latest release](https://github.com/Stelliro/RainRoom3D/releases/latest).
+2. Unzip it anywhere and run **`RainRoom3D.exe`**.
+
+Nothing is installed. To remove it, delete the folder.
+
+The exe isn't code-signed, so Windows SmartScreen may say *"Windows protected
+your PC"* the first time. Choose **More info → Run anyway**.
+
+Prefer to run from source? See [Run from source](#run-from-source).
+
+---
+
+## What it does
+
+**Design the house**
+- Draw the house on outdoor ground: width, depth, ceiling height and yard size.
+- Pick a **roof** (tin, metal, tile, shingle, wood or glass) and **walls** (brick, wood, glass or tin), and set how thick they are.
+- Add **windows** on any wall. Set their size, sill height, how they open (awning, casement, hopper, slider and more) and how far.
+- Place **You** (the listener) and any number of **speakers**. Connect each speaker to a real output device.
+- Work in the **floor plan** or the **3D view**. A live inspector shows whatever you click.
+
+**Hear the weather**
+- **Rain** from a light drizzle to a 100 mm/h downpour, with real drop sizes. Every drop has its own position, so you hear where it lands.
+- **Wind** with direction, natural gusts and an option for shifting direction:
+  - it pushes the rain onto the walls facing it;
+  - it whistles past the eaves;
+  - it blows in through open windows, while shut windows and thick walls keep it out.
+- **Thunder and lightning** from storms around the house: distant rumbles, close cracks, and flashes in the 3D view that light up the room.
+- **Drips and gutters** that keep running after the rain stops.
+- **Weather presets** from *Drizzle* to *Thunderstorm*.
+- A full **sound mix** (wash, drops, room echo and wind) to adjust to taste.
+
+**Listen your way**
+- **You (headphones):** binaural 3D sound from where you sit in the room.
+- **Speakers:** each mapped speaker plays what reaches its spot in the room. Speakers can be spread across several output devices at once.
+- **Phone:** scan a QR code to play the rain on your phone over Wi-Fi. Each phone gets its own room under the same sky.
+
+**Keep your rooms**
+- Your room **saves itself** and is waiting when you come back.
+- **Save as preset…** keeps a whole house: its shape, materials, windows, speakers and every sound setting. Opening the preset brings it back exactly as saved.
+- **File → Back to your previous room** undoes opening another house.
+- Four example houses to start from: a tin shed, a tile cottage, a brick house and a glass studio.
+
 <p align="center">
-  <img src="docs/media/hero_3d.jpg" alt="3D software preview with rain (actual app screenshot)" width="450" />
+  <img src="docs/media/hero_3d.jpg" alt="The 3D view in Listen mode with rain falling around the house" width="455" />
   &nbsp;
-  <img src="docs/media/screenshot_simulate.jpg" alt="Simulate rain controls (actual app screenshot)" width="450" />
+  <img src="docs/media/screenshot_speakers.jpg" alt="A speaker selected, with its output device and placement" width="455" />
 </p>
 
 ---
 
-## Status — work in progress
+## First listen
 
-RainRoom3D is a personal **Windows** experiment for spatial outdoor rain.
+1. Start RainRoom3D. It opens on the **Living Room** house, or on your own room once you've made one.
+2. Click a window and drag **Open** to let some rain in.
+3. Pick a weather preset in **Rain & sound**. Try *Steady rain*, then *Thunderstorm*.
+4. Set **Output** to **You (headphones)**, put headphones on and press **Play**.
 
-| Ready enough to try | Still rough |
-|---------------------|-------------|
-| House / window / speaker editor | Other roof/wall timbres still tuning |
-| **Tin roof rain** — wet ticks on the house (WIP) | Downpour density / other materials |
-| Binaural **You** + multi-device speakers | Multi-device depends on your OS devices |
-| Quantity · sharpness · volume · wind · **sound mix** | OpenGL vs software 3D varies by GPU |
-| Default Living Room layout | No first-class macOS / Linux support |
+**Design** mode is for building the house. **Listen** mode shows the 3D view
+and the weather. Hover over any control to see what it does.
 
 ---
 
-## What it can do
+## Run from source
 
-- **Design** a house on outdoor terrain — footprint, materials, windows (open style, sill, hinge)  
-- Place **You** (binaural listener) and **speakers**, assign real OS output devices  
-- **Simulate** outdoor rain over the house footprint (roof + a thin eaves ring)  
-- 3D droplets land as stacked wet ticks; tin is impact + dispersion, not a noise bed  
-- Rain couples through **open windows** (distance, delay, air absorption)  
-- **Sound mix** prefs (wash · droplets · room echo · wind air) — saved with the house  
-- **Play as You**, **mapped speakers**, or **You + speakers**  
-- Optional rain loop WAVs in [`assets/audio/rain/`](assets/audio/rain/)  
-
-<p align="center">
-  <img src="docs/media/screenshot_speakers.jpg" alt="Speakers step — device list and outputs (actual screenshot)" width="920" />
-</p>
-
----
-
-## Quick start
-
-**Requirements:** Windows · Python 3.10+ · sound output
+**Needs:** Windows, Python 3.10 or newer (developed on 3.14), and a sound output.
 
 ```powershell
 git clone https://github.com/Stelliro/RainRoom3D.git
@@ -69,73 +105,70 @@ python -m pip install -r requirements.txt
 python -m app.main
 ```
 
-Or double-click **`run.bat`**.
+Or double-click **`run.bat`**. The first time, it sets up a `.venv` with the
+requirements; after that it starts the app directly.
 
-### First listen
+`run.sh` does the same on Linux and macOS. Those platforms aren't supported
+yet, but the app may run.
 
-1. App loads **Living Room** by default  
-2. Open a window a little in the inspector  
-3. Quantity · Volume · Sharpness on **Simulate**; optional balance on **Sound mix**  
-4. **Play as You** with headphones  
-
----
-
-## Workflow
-
-| Step | What you do |
-|------|-------------|
-| **1 Design** | Size the house, place windows, set materials |
-| **2 Speakers** | Refresh devices, map OS outputs, test tones |
-| **3 Simulate** | Quantity / sharpness / wind / volume → Play |
-
-Views: **Floor plan** · **3D software** (always works) · **OpenGL 3D** (when available).
+Your room is kept in `configs/my_house.json` and your presets in
+`configs/presets/`. Both stay on your PC and are never added to git.
 
 ---
 
 ## Project layout
 
 ```text
-app/                 UI, models, spatial rain engine
-assets/audio/rain/   Optional outdoor rain WAV loops
-configs/             my_house.json (default), example_room.json
-docs/media/          README screenshots (real captures)
-scripts/             Screenshots, packaging, rain sample gen
+app/
+  audio/       the sound: rain, house model, wind, thunder, spatial rendering
+  graphics/    the 3D view and lightning
+  models/      house, materials, presets, settings
+  remote/      the phone app (LAN server + web app)
+  ui/studio/   the desktop app window
+  tools/       test suites and helper scripts
+assets/        rain samples and the app icon
+configs/       the default house and the example houses
+docs/media/    README screenshots
+scripts/       release build, source zip, screenshots, sample generation
 ```
 
-Recapture README images after UI changes:
+**Tests:**
 
 ```powershell
-python scripts/capture_screenshots.py
+python -m app.tools.test_rain_spatial
+python -m app.tools.test_settings
+python -m app.tools.test_remote
+python -m app.tools.test_ui_smoke
 ```
 
----
-
-## Releases
-
-See **[Releases](https://github.com/Stelliro/RainRoom3D/releases)** for **source** and optional **Windows portable** zips.
-
-Local Windows portable build (lean — excludes CUDA / ML packages that may sit in a global Python env):
+**Release build:** this script makes a portable Windows folder and zip. It
+leaves out CUDA and machine-learning packages a developer's Python may have
+installed, which keeps the build small.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_release.ps1
 # → dist/RainRoom3D/RainRoom3D.exe
-# → dist/RainRoom3D-windows-portable.zip
+# → dist/RainRoom3D-<version>-windows-portable.zip
 ```
 
-Source-only zip:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package_source_zip.ps1
-```
+The version number lives in `app/version.py`. To retake the screenshots in
+this README, run `python scripts/capture_screenshots.py`.
 
 ---
+
+## Changelog
+
+See **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](LICENSE) — Copyright (c) 2026 Stelliro.
+[PolyForm Noncommercial License 1.0.0](LICENSE). Copyright (c) 2026 Stelliro.
 
----
+You may use RainRoom3D for personal and other noncommercial purposes. **Commercial use is not allowed.**
 
-## Contributing / feedback
+## Feedback
 
-This is a **WIP** personal project. Issues and feedback are welcome.
+Bug reports, ideas and "the rain sounds wrong when…" reports are welcome in
+[Issues](https://github.com/Stelliro/RainRoom3D/issues).
+
+Please say which house, weather and output you used. A short recording helps a lot.

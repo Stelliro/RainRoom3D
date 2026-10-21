@@ -34,7 +34,7 @@ try:
 except Exception:  # pragma: no cover
     sd = None
 
-from app.audio.drop_bank import SHARP_BINS, SIZE_BINS_MM, DropSampleBank, _nearest
+from app.audio.drop_bank import SHARP_BINS, SIZE_BINS_MM, ToneBankSwitcher, _nearest, quantize_tone
 from app.audio.engine import synth_drop, _db, _peak_cap
 from app.audio.field_bed import OutdoorFieldBed
 from app.audio.field_router import OutdoorFieldRouter
@@ -67,8 +67,19 @@ from app.audio.surround import (
     speaker_test_channel_gains,
     speaker_test_pan_label,
 )
-from app.audio.wind import WindAirSynth
-from app.models.room import Room, Speaker
+from app.audio.gusts import GustField
+from app.audio.outdoor_router import OutdoorRouter, _cached_apertures, facing
+from app.audio.thunder import ThunderStorm
+from app.audio.house_wind import HouseWind
+from app.audio.wind import WindAirSynth, WindSound
+from app.audio.yard import YARD_REF_AREA_M2, YardRouter
+from app.models.room import (
+    TONE_RING_RECOMMENDED,
+    TONE_SOFT_RECOMMENDED,
+    TONE_WET_RECOMMENDED,
+    Room,
+    Speaker,
+)
 
 log = logging.getLogger("audio.spatial")
 
@@ -91,8 +102,14 @@ _DRIP_REF_Q = 0.35
 # and fuller: playback rate (D_REF/D)^exp. 0 = every size sounds the same.
 _SIZE_PITCH_EXP = 0.35
 _SIZE_PITCH_REF_MM = 3.0
-# Dense sheet above its grain cap: 1 = louder grains, 0 = continuous roar
-_DENSE_HIT_MAKEUP = 0.25
+# Dense sheet above its grain cap: 1 = louder grains, 0 = continuous roar.
+# The roar is Gaussian noise and heavy rain turned into white noise, so the
+# sheet stays all grains, few enough per stem (cap) to stay separate ticks.
+_DENSE_HIT_MAKEUP = 1.0
+_DENSE_MAX_GRAINS = 400.0
+# Below this the dense sheet's low band fuses into a smooth rumble as the
+# rate climbs; stacked water-grain "blubs" otherwise sound like boiling.
+_DENSE_FUSE_HZ = 700.0
 _DRIP_GAIN = 0.45
 # Gutter trickle: splashes/s per downspout at full flow, and its level.
 # The portal model has no structure-borne path (a downspout is bolted to the
@@ -110,9 +127,30 @@ _DROP_LEVEL = 0.55
 # One level for every drop, both paths. Anchored so the original tin-roof
 # house kept its loudness when the per-layer gains were replaced by physics.
 _LEVEL_TRIM = 2.11
+# A setting that's being dragged changes every block. Rebuilds that cost
+# real time (path calibration, kernels, window routing) wait until it has
+# held still this long (audio time); until then the old state keeps playing.
+_SETTLE_S = 0.3
+# Blocks the mixer keeps queued ahead of each device (~170 ms at 2048), so
+# one slow block or a busy UI thread doesn't run the device dry
+_LEAD_BLOCKS = 4
 # Ears vs speakers on the full path (was 1.55; −8.8 dB keeps the headphone
 # level where the tin-roof house had it while speakers come up to theirs)
 _HP_PATH_GAIN = 0.56
+# Weather sounds from outside (wind.WindSound, thunder.py) through the house's
+# openings (outdoor_router.py). Levels are outdoor amplitude -> engine units.
+_WIND_LEVEL = 0.38
+_ROAR_K = 0.35
+_WHISTLE_K = 0.9
+# How much of the wind outside comes from all around (trees, the next roofs)
+# rather than from upwind: low, so the windward side is loud and the lee
+# hears the darker wake. The deep roar wraps round the house more.
+_WIND_DIFFUSE = 0.25
+_ROAR_DIFFUSE = 0.30
+_THUNDER_LEVEL = 8.0
+# Thunder loudness vs distance on top of the strike's own 1/r (2 km = 1)
+_THUNDER_DIST_EXP = 0.40
+_THUNDER_FAR_EXP = 0.85
 
 
 def _soft_clip(sig: np.ndarray, ceiling: float = 0.88) -> np.ndarray:
@@ -123,40 +161,63 @@ def _soft_clip(sig: np.ndarray, ceiling: float = 0.88) -> np.ndarray:
     return c * np.tanh(x / c)
 
 
-class _SmoothLimiter:
-    """Block gain smoother: never hard-normalizes a block to a new scale.
+class _PeakLimiter:
+    """Look-ahead peak limiter, sample-accurate, one state per output stream.
 
-    Tracks envelope and eases gain toward ceiling so successive blocks
-    don't click when peaks differ.
+    The gain dips only around a peak (5 ms look-ahead and ramp, 50 ms hold)
+    instead of turning a whole block down for one sharp drop, which pumped
+    and squashed loud, transient rain. Output is delayed by the look-ahead.
     """
 
-    def __init__(self, ceiling: float = 0.88, release_s: float = 0.12, attack_s: float = 0.003):
+    def __init__(self, ceiling: float = 0.88, lookahead_s: float = 0.005, hold_s: float = 0.05):
         self.ceiling = float(ceiling)
-        self.release_s = float(release_s)
-        self.attack_s = float(attack_s)
-        self._gain = 1.0
+        self.lookahead_s = float(lookahead_s)
+        self.hold_s = float(hold_s)
+        self._state: Dict[object, tuple] = {}
 
     def reset(self):
-        self._gain = 1.0
+        self._state = {}
 
-    def process(self, x: np.ndarray, sr: int) -> np.ndarray:
+    def process(self, x: np.ndarray, sr: int, key: object = "out", flush: bool = False) -> np.ndarray:
         y = np.asarray(x, dtype=np.float64)
         if y.size == 0:
             return y
-        pk = float(np.max(np.abs(y)) + 1e-12)
-        # Target gain so peak would sit at ceiling (never boost, only attenuate)
-        target = 1.0 if pk <= self.ceiling else (self.ceiling / pk)
-        # Time constants per block
-        n = y.shape[0]
-        dt = n / max(1, int(sr))
-        if target < self._gain:
-            coeff = 1.0 - math.exp(-dt / max(1e-4, self.attack_s))
+        mono = y.ndim == 1
+        y2 = y[:, None] if mono else y
+        n, ch = y2.shape
+        a = max(1, int(round(self.lookahead_s * sr)))
+        h = max(1, int(round(self.hold_s * sr)))
+        st = None if flush else self._state.get(key)
+        if st is None or st[0].shape[1] != ch:
+            st = (np.zeros((a, ch)), np.ones(h + a))
+        pend, req_past = st
+        if flush:
+            y2 = np.concatenate([y2, np.zeros((a, ch))])
+        x_all = np.concatenate([pend, y2])
+        req = np.minimum(1.0, self.ceiling / (np.max(np.abs(x_all), axis=1) + 1e-12))
+        ext = np.concatenate([req_past, req])
+        # g1[p] = min(req[p - h .. p + a]); then a mean over [k - a + 1, k]
+        # can't rise above req at a peak (every term in it saw the peak)
+        from scipy.ndimage import minimum_filter1d
+        w = h + a + 1
+        g1 = minimum_filter1d(ext, size=w, origin=(w // 2) - h, mode="nearest")
+        c = np.concatenate([[0.0], np.cumsum(g1)])
+        off = len(req_past)
+        m = len(x_all) - a
+        idx = np.arange(m) + off
+        g = (c[idx + 1] - c[idx + 1 - a]) / a
+        out = x_all[:m] * g[:, None]
+        if flush:
+            out = out[a:]
+            self._state.pop(key, None)
         else:
-            coeff = 1.0 - math.exp(-dt / max(1e-4, self.release_s))
-        self._gain += (target - self._gain) * coeff
-        out = y * self._gain
-        # Final soft safety (sample-wise) — no hard brickwall
-        return _soft_clip(out, self.ceiling)
+            self._state[key] = (x_all[m:].copy(), ext[-(h + a):].copy())
+        # Safety only: transparent below 0.9, a soft knee up to 0.98
+        mag = np.abs(out)
+        over = mag > 0.9
+        if np.any(over):
+            out = np.where(over, np.sign(out) * (0.9 + 0.08 * np.tanh((mag - 0.9) / 0.08)), out)
+        return out[:, 0] if mono else out
 
 
 def _hostapi_score(hostapi_index: Optional[int], hostapis: list) -> int:
@@ -675,15 +736,17 @@ class SpatialRainEngine:
         self._lock = threading.Lock()
         self.running = False
         self._devices_cache = list_output_devices()
-        # Pre-baked hit grains + multi-hit chains (built on first play)
-        self._drop_bank = DropSampleBank(samplerate=self.samplerate, seed=2026)
+        # Pre-baked hit grains + multi-hit chains (built on first play). Tone
+        # slider changes rebuild it in the background (see _follow_tone_bank).
+        self._bank_switch = ToneBankSwitcher(samplerate=self.samplerate, seed=2026)
+        self._drop_bank = self._bank_switch.make_bank(self._room_tone())
         self.use_drop_bank = True
         # Internal synth level (before user volume).
         self._master = 0.85
         # Comfortable at vol ~75–85% without riding the limiter (crackle source)
         self._output_fs_gain = 3.2
         self._output_ceiling = 0.88
-        self._limiter = _SmoothLimiter(ceiling=0.88, release_s=0.14, attack_s=0.002)
+        self._limiter = _PeakLimiter(ceiling=0.88)
         self._mixer_thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
         self._hp_stream = None
@@ -695,6 +758,19 @@ class SpatialRainEngine:
         self.use_noise_bed = False
         # Outdoor wind / air (layered gusts — not pink static)
         self._wind_air = WindAirSynth(sr=self.samplerate, seed=4242)
+        # Wind and thunder heard through the house (gusts / wind / thunder.py)
+        self.use_weather_sounds = True
+        self._gusts = GustField(self.samplerate, seed=515)
+        self._gust_u = np.zeros(0)
+        self._wind_snd = WindSound(self.samplerate, seed=4242)
+        self._wind_router = OutdoorRouter(self.samplerate)
+        self._roar_router = OutdoorRouter(self.samplerate)
+        self._whistle_router = OutdoorRouter(self.samplerate)
+        # What the wind does to the house: drafts, buffeting, rattles
+        self._house_wind = HouseWind(self.samplerate, seed=5150)
+        self._house_router = OutdoorRouter(self.samplerate)
+        self._storm = ThunderStorm(self.samplerate, seed=99)
+        self._thunder_routers: Dict[int, OutdoorRouter] = {}
         # Continuous outdoor field (procedural + optional WAV samples)
         self.use_outdoor_field = True
         self._field = OutdoorFieldBed(sr=self.samplerate, seed=2024)
@@ -718,10 +794,17 @@ class SpatialRainEngine:
         self._last_wall: Dict[str, np.ndarray] = {}
         # Dense texture: drops below the discrete split (see rain_texture.py)
         self.use_dense_texture = True
-        self._dense = DenseRainTexture(sr=self.samplerate, n_stems=3, seed=777)
+        self._dense = DenseRainTexture(sr=self.samplerate, n_stems=3, seed=777,
+                                       max_grains_per_sec=_DENSE_MAX_GRAINS)
         self._dense_kernel_id: Optional[tuple] = None
+        self._kernel_job: Optional[dict] = None
+        # name → (fingerprint, audio time it last changed); see _settled
+        self._settle: Dict[str, Tuple[object, float]] = {}
         self._dense_kernel_gain: Dict[str, float] = {}
         self._last_dense_gains: Dict[str, Dict[object, float]] = {}
+        # Rain on the whole yard, heard through each window / wall (yard.py)
+        self.use_yard = True
+        self._yard = YardRouter(self.samplerate)
         # Path calibration per catchment layer: {"full": {recv: g}, "cheap": {recv: g}}
         self._path_cal: Dict[str, Dict[str, Dict[object, float]]] = {}
         self._cal_fp: Optional[tuple] = None
@@ -771,13 +854,13 @@ class SpatialRainEngine:
             self._pending_hits.extend(hits)
             self._visual_seen_t = time.perf_counter()
 
-    def _apply_master(self, x: np.ndarray) -> np.ndarray:
-        """Apply user volume + soft limiter (no hard per-block peak-norm)."""
+    def _apply_master(self, x: np.ndarray, key: object = "you", flush: bool = False) -> np.ndarray:
+        """Apply user volume + the peak limiter of output stream ``key``."""
         vol = self.get_volume()
         # Perceptual volume curve; keep gain modest to avoid constant limiting
         g = (vol ** 0.85) * float(self._output_fs_gain)
         y = np.asarray(x, dtype=np.float64) * g
-        return self._limiter.process(y, self.samplerate)
+        return self._limiter.process(y, self.samplerate, key=key, flush=flush)
 
     # ----- scheduling -----
     def _sharpness(self) -> float:
@@ -1165,7 +1248,7 @@ class SpatialRainEngine:
         return self._short_grain(mono, ms=26.0 + 4.0 * q, fade_ms=8.0)
 
     def _hit_amp(self, drop_d: float) -> float:
-        mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
+        mix_d = max(0.0, min(3.0, float(getattr(self.room, "mix_droplets", 1.0))))
         return (
             self._drop_amp(drop_d)
             * math.exp(float(self._rng.normal(0.0, 0.25)))
@@ -1207,6 +1290,8 @@ class SpatialRainEngine:
         _n, dist, split = self._rain_state()
         drop_d = float(dist.sample(1, self._rng, split, D_MAX_MM)[0]) if dist is not None else 2.0
         mono = self._drop_grain(surface, drop_d, layer) * self._hit_amp(drop_d)
+        if layer in ("wall", "window", "sill"):
+            mono = mono * self._gust_scalar()
         self._evt_id += 1
         self._queue_cheap(mono, (sx, sy, sz), kind, layer, delay_n)
 
@@ -1259,6 +1344,8 @@ class SpatialRainEngine:
         drop_d = float(dist.sample(1, self._rng, split, D_MAX_MM)[0])
         surface = self._surface_for_layer(layer)
         mono = self._drop_grain(surface, drop_d, layer) * self._hit_amp(drop_d)
+        if layer in ("wall", "window", "sill"):
+            mono = mono * self._gust_scalar()
         self._evt_id += 1
         if self.full_path_events or not self._path_cal:
             self._render_and_queue(mono, (x, y, z), layer, schedule_delay_n, 0)
@@ -1459,26 +1546,108 @@ class SpatialRainEngine:
             int(round(q * 10)),
             _SIZE_PITCH_EXP,
             round(self._tone_rate(), 3),
+            # A swapped-in tone bank means new grains, so new kernels
+            int(getattr(self._drop_bank, "generation", 0)),
         )
 
+    def _room_tone(self) -> Tuple[float, float, float]:
+        """Ring / Wetness / Softness sliders, as the bank keys them."""
+        r = self.room
+        return (
+            float(getattr(r, "tone_ring", TONE_RING_RECOMMENDED)),
+            float(getattr(r, "tone_wet", TONE_WET_RECOMMENDED)),
+            float(getattr(r, "tone_soft", TONE_SOFT_RECOMMENDED)),
+        )
+
+    def _follow_tone_bank(self) -> None:
+        """Swap in a rebuilt bank once the tone sliders settle (block start only).
+
+        The build runs on a worker thread; this is a cheap check, so an audio
+        block never waits on synthesis.
+        """
+        new = self._bank_switch.poll(self._room_tone(), self._time, self._drop_bank)
+        if new is not None:
+            log.info("Tone bank swapped in: tone=%s (built in %.2f s)", new.tone, new.build_s)
+            self._drop_bank = new
+
+    def _bank_for_start(self) -> None:
+        """Pick the bank for the room's tone before a stream opens.
+
+        Sliders moved while stopped (or a newly loaded house) never reach
+        _follow_tone_bank, so without this Play would build the stale bank and
+        then play the old drop character until the background swap lands.
+        """
+        if quantize_tone(*self._room_tone()) != self._drop_bank.tone:
+            self._drop_bank = self._bank_switch.bank_for(self._room_tone())
+
+    def _settled(self, name: str, fp: object) -> bool:
+        """True once ``fp`` has held still for _SETTLE_S of audio time (and
+        the first time it's seen, so startup doesn't wait)."""
+        last = self._settle.get(name)
+        if last is None or last[0] != fp:
+            self._settle[name] = (fp, self._time)
+            return last is None
+        return (self._time - last[1]) >= _SETTLE_S
+
     def _ensure_dense_kernels(self) -> None:
-        """Bank grains made with the same recipe as a single drop (_drop_grain)."""
+        """Bank grains made with the same recipe as a single drop (_drop_grain).
+
+        The first set builds at once. A change (roof material, pitch, the
+        quantity's sharpness step…) is rebuilt on a worker once the settings
+        hold still; the old grains keep playing until it swaps in here."""
+        job = self._kernel_job
+        if job is not None and job["done"].is_set():
+            self._kernel_job = None
+            if job.get("kernels") is not None:
+                self._apply_kernels(job["key"], job["kernels"])
         key = self._dense_kernel_key()
         if key == self._dense_kernel_id:
             return
-        self._drop_bank.ensure_built()
-        sources, sharp, _q10, _exp, tone = key
+        if self._dense_kernel_id is None:
+            self._apply_kernels(key, self._build_kernels(key, self._drop_bank))
+            return
+        if self._kernel_job is not None or not self._settled("kernels", key):
+            return
+        job = {"key": key, "done": threading.Event(), "kernels": None}
+        bank = self._drop_bank
+
+        def run() -> None:
+            try:
+                job["kernels"] = self._build_kernels(key, bank, between_blocks=True)
+            except Exception:
+                log.exception("dense kernel build failed")
+            finally:
+                job["done"].set()
+
+        self._kernel_job = job
+        threading.Thread(target=run, name="dense-kernels", daemon=True).start()
+
+    def _build_kernels(self, key: tuple, bank_src, between_blocks: bool = False) -> Dict[str, Tuple[List[np.ndarray], float]]:
+        bank_src.ensure_built()
+        sources, sharp, _q10, _exp, tone, _gen = key
         vrng = np.random.RandomState(4111)
+        out: Dict[str, Tuple[List[np.ndarray], float]] = {}
         for source, surface in list(sources) + [("gutter", "water")]:
+            if between_blocks:
+                # Stay off the GIL while an audio block is rendering
+                self._bank_switch._wait_audio_idle()
             grains = []
             for size in SIZE_BINS_MM:
-                bank = self._drop_bank.variants(surface, size, sharp) or [
-                    self._drop_bank.pick(surface=surface, size_mm=size, sharpness=sharp, chain_n=1)
+                bank = bank_src.variants(surface, size, sharp) or [
+                    bank_src.pick(surface=surface, size_mm=size, sharpness=sharp, chain_n=1)
                 ]
                 for g in make_variants(bank, VARIANTS_PER_SIZE, vrng, self._size_rate(size) * tone):
                     grains.append(self._shape_grain(g, surface) * hm.surface_radiate(surface))
+            out[source] = (grains, hm.surface_radiate(surface))
+        return out
+
+    def _apply_kernels(self, key: tuple, kernels: Dict[str, Tuple[List[np.ndarray], float]]) -> None:
+        for source, (grains, gain) in kernels.items():
             self._dense.set_kernels(source, SIZE_BINS_MM, grains)
-            self._dense_kernel_gain[source] = hm.surface_radiate(surface)
+            self._dense_kernel_gain[source] = gain
+            if source == "ground":
+                # The yard is the same wet ground, farther out
+                self._dense.share_kernels("yard", "ground")
         self._dense_kernel_id = key
 
     def _dense_fingerprint(self, visual: bool = False) -> tuple:
@@ -1498,6 +1667,7 @@ class SpatialRainEngine:
             self._dense_kernel_key()[:2], self._patch_key,
             round(float(L.x), 2), round(float(getattr(L, "y", 1.2)), 2), round(float(L.z), 2),
             round(float(getattr(L, "yaw", 0.0)), 2), spk, wins, self.render_listener_binaural,
+            round(hm.wall_thickness(r), 3), round(hm.roof_thickness(r), 4),
         )
 
     def _cal_layers(self) -> List[str]:
@@ -1584,7 +1754,7 @@ class SpatialRainEngine:
         one chunk of probe spots per block (~5 ms) so dragging a speaker never
         stalls the audio; the very first calibration runs at once."""
         fp = self._dense_fingerprint()
-        if fp != self._cal_fp and (self._time - self._cal_t) > 0.5:
+        if fp != self._cal_fp and (not self._path_cal or self._settled("cal", fp)):
             self._cal_fp = fp
             self._cal_t = self._time
             n_parts = max(1, _CAL_POINTS // _CAL_CHUNK)
@@ -1630,6 +1800,7 @@ class SpatialRainEngine:
         if not self.use_dense_texture or frames <= 0:
             return
         self._dense.hit_makeup = _DENSE_HIT_MAKEUP
+        self._dense.fuse_hz = _DENSE_FUSE_HZ
         q = float(getattr(self.room, "droplet_density", 0.5) or 0.0)
         _n, dist, split = self._rain_state()
         plan = {}
@@ -1651,7 +1822,7 @@ class SpatialRainEngine:
             plan["gutter"] = (rate, g_dist, 0.6, 2.5, k)
             gains["gutter"] = self._source_gains(("gutter",), {})
         if raining:
-            mix_d = max(0.0, min(2.5, float(getattr(self.room, "mix_droplets", 1.0))))
+            mix_d = max(0.0, min(3.0, float(getattr(self.room, "mix_droplets", 1.0))))
             # Drizzle: keep the sheet ~6 dB under the ticks; physical by moderate rain.
             trim = 10.0 ** (-6.0 * (1.0 - min(1.0, q / 0.5)) / 20.0)
             k = (loudness_gain(q) * _DROP_LEVEL * self._master * (mix_d ** 0.85) * trim
@@ -1671,6 +1842,9 @@ class SpatialRainEngine:
                     continue
                 plan[source] = (total * share, dist, D_MIN_MM, split, k)
                 gains[source] = g
+            if self.use_yard and self._dense.has_source("yard"):
+                # No voiced drops out there: every size is texture
+                plan["yard"] = (dist.flux(D_MIN_MM, D_MAX_MM) * YARD_REF_AREA_M2, dist, D_MIN_MM, D_MAX_MM, k)
         n_on = sum(1 for sp in self.room.speakers if getattr(sp, "enabled", True))
         self._dense.set_stems(min(4, max(2, n_on)))
         stems = self._dense.render(frames, plan)
@@ -1678,15 +1852,27 @@ class SpatialRainEngine:
             return
         n_st = self._dense.n_stems
         for source, st in stems.items():
+            if source == "yard":
+                ears = self._last_binaural
+                if ears is None or ears.shape[0] != frames:
+                    ears = None
+                self._yard.process(self.room, st, mix, ears, WALL_BUS, _HP_PATH_GAIN, now=self._time)
+                continue
             g_src = gains.get(source) or self._last_dense_gains.get(source, {})
             self._last_dense_gains[source] = g_src
+            if source in ("facade", "glass"):
+                gg = self._gust_gain()
+                if gg is not None and len(gg) == st.shape[-1]:
+                    st = st * gg
             for i, sp in enumerate(self.room.speakers):
                 g = g_src.get(i, 0.0)
                 if g <= 0.0 or not getattr(sp, "enabled", True):
                     continue
                 buf = st[i % n_st] * g
                 mix[i] = mix[i] + buf if i in mix else buf
-            if source == "roof" and not visual:
+            # Same in both modes: neither the view's drops nor the scheduled
+            # ones feed the roof bus themselves, so the texture always does
+            if source == "roof":
                 rid = WALL_BUS["roof"]
                 rb = st[0] * 0.144
                 mix[rid] = mix[rid] + rb if rid in mix else rb
@@ -1802,6 +1988,7 @@ class SpatialRainEngine:
         if float(np.max(np.abs(layers.get("mix", np.zeros(1))))) < 1e-8:
             return
 
+        self._field_router.now = self._time
         routed = self._field_router.process_layers(
             self.room,
             layers,
@@ -1872,9 +2059,20 @@ class SpatialRainEngine:
 
     def _advance(self, frames: int) -> Dict[int, np.ndarray]:
         """Schedule chained outdoor impacts; return per-speaker mono field."""
+        # Mark the block busy so a background tone-bank build stays off the GIL
+        self._bank_switch.block_begin()
+        try:
+            return self._advance_block(frames)
+        finally:
+            self._bank_switch.block_end()
+
+    def _advance_block(self, frames: int) -> Dict[int, np.ndarray]:
         sr = self.samplerate
         dt = frames / float(sr)
         self._update_wind(dt)
+        self._gust_u = self._gusts.advance(frames, self._wind_speed(),
+                                           gusty=bool(getattr(self.room, "wind_vary_speed", False)))
+        self._follow_tone_bank()
         t0 = self._time
         t1 = t0 + dt
         now = time.perf_counter()
@@ -1927,32 +2125,11 @@ class SpatialRainEngine:
         # Continuous outdoor field through portals (procedural ± WAV samples)
         self._mix_outdoor_field(frames, mix)
 
-        # Wind air — layered body/whoosh/gusts (WindAirSynth), not pink static
-        wabs = self._wind_speed()
-        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
-        if mix_wind > 0.02 and wabs > 0.03:
-            open_avg = self._open_avg()
-            # Audible under rain without drowning droplets; mix_wind is gain
-            wind_level = (0.055 + 0.070 * wabs) * mix_wind
-            mono_wind = self._wind_air.render(
-                frames, wind=wabs, level=wind_level, open_avg=open_avg
-            )
-            if mono_wind is not None and float(np.max(np.abs(mono_wind))) > 1e-8:
-                if self._last_binaural is not None and self._last_binaural.shape[0] == frames:
-                    wx, wz = self._wind_push()
-                    yaw = float(getattr(self.room.listener, "yaw", 0.0))
-                    c, s = math.cos(yaw), math.sin(yaw)
-                    right = wx * c - wz * s
-                    pan = max(-1.0, min(1.0, right / max(0.08, wabs)))
-                    # Headphones a touch quieter (close to ears)
-                    bi = self._wind_air.to_stereo(mono_wind, pan=pan, level=0.50)
-                    if bi.shape[0] == frames:
-                        self._last_binaural = self._last_binaural + bi
-                spk_g = 0.70 * (0.40 + 0.60 * wabs) * (0.40 + 0.60 * open_avg)
-                for i, spk in enumerate(self.room.speakers):
-                    if i not in mix or not getattr(spk, "enabled", True):
-                        continue
-                    mix[i] = mix[i] + mono_wind * spk_g
+        # Wind and thunder from outside, through windows, walls and roof
+        if self.use_weather_sounds:
+            self._mix_weather(frames, mix)
+        else:
+            self._mix_legacy_wind(frames, mix)
 
         # Wall buses stay dry (outdoor portal energy). Speakers get room.
         spk_mix: Dict[int, np.ndarray] = {}
@@ -1983,6 +2160,127 @@ class SpatialRainEngine:
             self._last_binaural = _soft_clip(self._last_binaural * bi_make, 0.88)
         return out
 
+    # ----- wind + thunder -----
+    def _gust_gain(self) -> Optional[np.ndarray]:
+        """Rain on the windward walls follows the gusts: amplitude ~ sqrt(rate)."""
+        u = self._gust_u
+        mean = self._wind_speed()
+        if mean <= 0.03 or u is None or len(u) == 0:
+            return None
+        ratio = u / max(1e-6, mean)
+        wet = min(1.0, mean / 0.15)  # how much of the facade rain the wind drives
+        return np.sqrt(np.clip(1.0 + wet * (ratio - 1.0), 0.15, 3.0))
+
+    def _gust_scalar(self) -> float:
+        g = self._gust_gain()
+        return 1.0 if g is None else float(g[-1])
+
+    def _wind_from(self) -> float:
+        """Bearing the wind comes FROM (wind_direction_deg is where it blows to)."""
+        return (self._wind_dir_deg() + 180.0) % 360.0
+
+    def _mix_weather(self, frames: int, mix: Dict[int, np.ndarray]) -> None:
+        room = self.room
+        ears = self._last_binaural
+        if ears is None or ears.shape[0] != frames:
+            ears = None
+        now = self._time
+        # --- wind
+        mix_wind = max(0.0, min(2.5, float(getattr(room, "mix_wind", 1.0))))
+        mean = self._wind_speed()
+        u = self._gust_u if len(self._gust_u) == frames else np.full(frames, mean)
+        if mix_wind > 0.01 and mean > 0.02:
+            wfrom = self._wind_from()
+            _fp, aps = _cached_apertures(room)
+            whistlers = []
+            for ap in aps:
+                if ap.key[0] != "win":
+                    continue
+                g_f, _fc = facing(ap, wfrom, 0.0, 0.25)
+                whistlers.append((ap.key, ap.gap_m, ap.open_amt, min(1.0, g_f)))
+            rush, roar, sing = self._wind_snd.render(u, whistlers)
+            k = _WIND_LEVEL * mix_wind * self._master
+            self._wind_router.process(room, rush * k, mix, ears, WALL_BUS, _HP_PATH_GAIN,
+                                      az=round(wfrom), el=5.0, diffuse=_WIND_DIFFUSE, now=now)
+            self._roar_router.process(room, roar * (k * _ROAR_K), mix, ears, WALL_BUS, _HP_PATH_GAIN,
+                                      az=round(wfrom), el=5.0, diffuse=_ROAR_DIFFUSE, now=now)
+            if sing:
+                self._whistle_router.process(room, np.zeros(frames), mix, ears, WALL_BUS, _HP_PATH_GAIN,
+                                             now=now, local={key: v * (k * _WHISTLE_K) for key, v in sing.items()},
+                                             local_only=True)
+            # Drafts through the house, gusts flexing the panels, rattling sashes:
+            # every aperture key each block, so the routing never re-plans
+            house = self._house_wind.render(room, aps, _fp, u, mean, wfrom)
+            zero = np.zeros(frames)
+            self._house_router.process(room, zero, mix, ears, WALL_BUS, _HP_PATH_GAIN, now=now,
+                                       local={ap.key: house.get(ap.key, zero) * k for ap in aps},
+                                       local_only=True)
+        # --- thunder
+        rate = float(getattr(room, "thunder_rate", 0.0) or 0.0)
+        mix_t = max(0.0, min(2.5, float(getattr(room, "mix_thunder", 1.0))))
+        self._storm.update(now, rate, float(getattr(room, "thunder_distance", 0.45)),
+                           self._wind_from() if mean > 0.05 else None)
+        live = set()
+        for strike, buf in self._storm.take(now, frames):
+            key = id(strike)
+            live.add(key)
+            if mix_t <= 0.005:
+                continue
+            r = self._thunder_routers.get(key)
+            if r is None:
+                r = self._thunder_routers[key] = OutdoorRouter(self.samplerate)
+            # Past ~2 km the air bends thunder up and away from the ground, so
+            # far storms fade faster than near ones grow
+            ratio = 2000.0 / max(150.0, strike.dist_m)
+            g = (_THUNDER_LEVEL * mix_t * self._master
+                 * ratio ** (_THUNDER_DIST_EXP if ratio >= 1.0 else _THUNDER_FAR_EXP))
+            r.process(room, buf * g, mix, ears, WALL_BUS, _HP_PATH_GAIN,
+                      az=strike.az_deg, el=strike.el_deg, diffuse=0.25, now=now)
+        for key in [k for k in self._thunder_routers if k not in live]:
+            del self._thunder_routers[key]
+
+    def lightning_flashes(self, t0: float, t1: float):
+        """(engine time, brightness 0..1, bearing from, km) of flashes in [t0, t1)."""
+        return self._storm.flashes_between(t0, t1)
+
+    def playback_time(self) -> float:
+        """Engine time of the sound playing right now (the mixer runs ahead)."""
+        period = self.blocksize / float(self.samplerate)
+        depths = [q.qsize() for q in self._queues.values()] if self._queues else []
+        if self._hp_queue is not None:
+            depths.append(self._hp_queue.qsize())
+        ahead = (min(depths) if depths else 0) * period
+        return max(0.0, self._time - ahead)
+
+    def _mix_legacy_wind(self, frames: int, mix: Dict[int, np.ndarray]) -> None:
+        """The old quiet mono wind bed (WindAirSynth), kept for A/B renders."""
+        wabs = self._wind_speed()
+        mix_wind = max(0.0, min(2.5, float(getattr(self.room, "mix_wind", 1.0))))
+        if mix_wind > 0.02 and wabs > 0.03:
+            open_avg = self._open_avg()
+            # Audible under rain without drowning droplets; mix_wind is gain
+            wind_level = (0.055 + 0.070 * wabs) * mix_wind
+            mono_wind = self._wind_air.render(
+                frames, wind=wabs, level=wind_level, open_avg=open_avg
+            )
+            if mono_wind is not None and float(np.max(np.abs(mono_wind))) > 1e-8:
+                if self._last_binaural is not None and self._last_binaural.shape[0] == frames:
+                    wx, wz = self._wind_push()
+                    yaw = float(getattr(self.room.listener, "yaw", 0.0))
+                    c, s = math.cos(yaw), math.sin(yaw)
+                    right = wx * c - wz * s
+                    pan = max(-1.0, min(1.0, right / max(0.08, wabs)))
+                    # Headphones a touch quieter (close to ears)
+                    bi = self._wind_air.to_stereo(mono_wind, pan=pan, level=0.50)
+                    if bi.shape[0] == frames:
+                        self._last_binaural = self._last_binaural + bi
+                spk_g = 0.70 * (0.40 + 0.60 * wabs) * (0.40 + 0.60 * open_avg)
+                for i, spk in enumerate(self.room.speakers):
+                    if i not in mix or not getattr(spk, "enabled", True):
+                        continue
+                    mix[i] = mix[i] + mono_wind * spk_g
+
+
     def _reset_sim(self, seed: int = 11):
         self._voices = deque()
         self._stereo_voices = deque()
@@ -1990,11 +2288,21 @@ class SpatialRainEngine:
             self._pending_hits = []
         self._last_binaural = np.zeros((0, 2), dtype=np.float64)
         self._time = 0.0
+        self._settle = {}
         self._next_event = 0.0
         self._evt_id = 0
         self._rng = np.random.RandomState(seed)
         self._wind_air = WindAirSynth(sr=self.samplerate, seed=4242 + seed)
+        self._gusts.reset(515 + seed)
+        self._gust_u = np.zeros(0)
+        self._wind_snd.reset(4242 + seed)
+        self._house_wind.reset(5150 + seed)
+        for r in (self._wind_router, self._roar_router, self._whistle_router, self._house_router):
+            r.reset()
+        self._storm.reset(99 + seed)
+        self._thunder_routers = {}
         self._dense.reset(777 + seed)
+        self._yard.reset()
         self._cal_t = -1e9
         self._runoff.reset(31 + seed)
         self._field = OutdoorFieldBed(sr=self.samplerate, seed=2024 + seed)
@@ -2061,7 +2369,7 @@ class SpatialRainEngine:
                     room_width=float(self.room.width),
                     room_depth=float(self.room.depth),
                 )
-                out[di] = self._apply_master(block).astype(np.float32)
+                out[di] = self._apply_master(block, key=di).astype(np.float32)
                 continue
 
             if len(group) == 1 or ch == 1:
@@ -2078,10 +2386,10 @@ class SpatialRainEngine:
                 g = _db(float(getattr(spk, "gain_db", 0.0) or 0.0))
                 mono = mono * g
                 if ch == 1:
-                    out[di] = self._apply_master(mono).astype(np.float32)
+                    out[di] = self._apply_master(mono, key=di).astype(np.float32)
                 else:
                     stereo = np.stack([mono, mono], axis=1)
-                    out[di] = self._apply_master(stereo).astype(np.float32)
+                    out[di] = self._apply_master(stereo, key=di).astype(np.float32)
                 continue
 
             left = np.zeros(frames, dtype=np.float64)
@@ -2108,19 +2416,29 @@ class SpatialRainEngine:
                 right += mono * gR * scale
 
             stereo = np.stack([left, right], axis=1)
-            out[di] = self._apply_master(stereo * 1.05).astype(np.float32)
+            out[di] = self._apply_master(stereo * 1.05, key=di).astype(np.float32)
 
         return out
 
     def _mixer_loop(self):
-        """Realtime producer: advance sim once, push speaker buses + optional You bus."""
+        """Realtime producer: advance sim once, push speaker buses + optional You bus.
+
+        Paced by the devices, not the clock: it keeps _LEAD_BLOCKS queued
+        ahead of the emptiest output, so a slow block (a setting just
+        changed) or a busy UI thread eats into the lead instead of the sound.
+        """
         block = self.blocksize
         period = block / self.samplerate
-        next_t = time.perf_counter()
         want_spk = bool(self._queues)
         want_you = bool(getattr(self, "_include_you", False) or self._mode == "headphones")
         while not self._stop_flag.is_set():
             try:
+                depths = [q.qsize() for q in self._queues.values()] if want_spk else []
+                if want_you and self._hp_queue is not None:
+                    depths.append(self._hp_queue.qsize())
+                if depths and min(depths) >= _LEAD_BLOCKS:
+                    time.sleep(period * 0.25)
+                    continue
                 with self._lock:
                     mix = self._advance(block)
                     dev_blocks = self._device_blocks_from_mix(mix, block) if want_spk else {}
@@ -2143,28 +2461,21 @@ class SpatialRainEngine:
                         bus = self._buses.get(di)
                         if bus is not None and int(bus.samplerate) != int(self.samplerate):
                             data = _resample_audio(data, self.samplerate, bus.samplerate)
-                        if q.qsize() < 10:
-                            try:
-                                q.put_nowait(data)
-                            except queue.Full:
-                                pass
+                        try:
+                            q.put_nowait(data)
+                        except queue.Full:
+                            pass
 
                 if want_you and you_block is not None and self._hp_queue is not None:
                     hp_sr = int(getattr(self, "_hp_stream_sr", self.samplerate) or self.samplerate)
                     if hp_sr != int(self.samplerate):
                         you_block = _resample_audio(you_block, self.samplerate, hp_sr)
-                    if self._hp_queue.qsize() < 12:
-                        try:
-                            self._hp_queue.put_nowait(you_block)
-                        except queue.Full:
-                            pass
-
-                next_t += period
-                sleep = next_t - time.perf_counter()
-                if sleep > 0:
-                    time.sleep(sleep)
-                else:
-                    next_t = time.perf_counter()
+                    try:
+                        self._hp_queue.put_nowait(you_block)
+                    except queue.Full:
+                        pass
+                if not depths:
+                    time.sleep(period)
             except Exception:
                 log.exception("mixer loop error")
                 time.sleep(0.01)
@@ -2265,6 +2576,7 @@ class SpatialRainEngine:
         # Build hit bank once before streaming so the mixer never hitch-builds
         if self.use_drop_bank:
             try:
+                self._bank_for_start()
                 self._drop_bank.ensure_built()
             except Exception:
                 log.exception("drop bank build failed — will live-synth")
@@ -2373,6 +2685,7 @@ class SpatialRainEngine:
             raise RuntimeError("sounddevice not installed")
         if self.use_drop_bank:
             try:
+                self._bank_for_start()
                 self._drop_bank.ensure_built()
             except Exception:
                 log.exception("drop bank build failed — will live-synth")
@@ -2512,7 +2825,7 @@ class SpatialRainEngine:
             if bi is not None and bi.shape[0] == frames:
                 out[pos : pos + frames] += bi
             pos += frames
-        return self._apply_master(out).astype(np.float64)
+        return self._apply_master(out, key="offline", flush=True).astype(np.float64)
 
     def _emit_block(self, n: int):
         """Legacy stereo block = listener binaural."""
@@ -2522,3 +2835,36 @@ class SpatialRainEngine:
         if bi is None or bi.shape[0] != frames:
             bi = np.zeros((frames, 2), dtype=np.float64)
         return self._apply_master(bi).astype(np.float32)
+
+    # ----- block render for other outputs (phone streaming, app/remote) -----
+    def prepare_for_stream(self, seed: int = 3) -> None:
+        """Get ready for render_listener_block() without opening a device.
+
+        Does what start_headphones does before its stream opens: pick + build
+        the drop bank for the room's tone, reset the sim and the limiter.
+        """
+        if self.running:
+            raise RuntimeError("engine is already playing on a device")
+        if self.use_drop_bank:
+            try:
+                self._bank_for_start()
+                self._drop_bank.ensure_built()
+            except Exception:
+                log.exception("drop bank build failed — will live-synth")
+        self.blocksize = max(2048, int(self.blocksize))
+        with self._lock:
+            self._reset_sim(seed)
+            self._limiter.reset()
+
+    def render_listener_block(self, frames: Optional[int] = None) -> np.ndarray:
+        """Next block of the listener ("You") binaural mix: float32 (frames, 2).
+
+        Same as the headphone stream: advances the sim, then master volume and
+        the soft limiter. Call prepare_for_stream() first; not while running on
+        a device (that mixer thread advances the same sim).
+        """
+        if self.running:
+            raise RuntimeError("engine is already playing on a device")
+        n = int(frames) if frames else int(self.blocksize)
+        with self._lock:
+            return self._emit_block(n)

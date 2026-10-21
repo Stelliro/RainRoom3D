@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
+from app.models.materials import role_material
 from app.models.room import (
     Headphones,
     Listener,
@@ -79,6 +80,11 @@ def _window_from_dict(d: Dict[str, Any]) -> Window:
 def load_room(path: str) -> Room:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    return room_from_dict(data)
+
+
+def room_from_dict(data: Dict[str, Any]) -> Room:
+    """A Room from the dict save_room writes (room_to_dict's inverse)."""
     r = data.get("room", {})
     windows = [_window_from_dict(w) for w in data.get("windows", [])]
     speakers = [_speaker_from_dict(s) for s in data.get("speakers", [])]
@@ -99,8 +105,11 @@ def load_room(path: str) -> Room:
         height=float(r.get("height", 2.6)),
         depth=float(r.get("depth", 3.2)),
         terrain_size=float(r.get("terrain_size", 40.0)),
-        roof_material=str(r.get("roof_material", "Metal Roof")),
-        wall_material=str(r.get("wall_material", "Brick Wall")),
+        # Older files: "Glass Window" / "Wood" walls, wall names on the roof
+        roof_material=role_material(r.get("roof_material", "Metal Roof"), "roof"),
+        wall_material=role_material(r.get("wall_material", "Brick Wall"), "wall"),
+        wall_thickness=float(r.get("wall_thickness", 0.0) or 0.0),
+        roof_thickness=float(r.get("roof_thickness", 0.0) or 0.0),
         name=str(r.get("name", data.get("name", "My House"))),
         windows=windows,
         speakers=speakers,
@@ -131,6 +140,9 @@ def load_room(path: str) -> Room:
         wind_speed_range=float(rain.get("wind_speed_range", 0.25)),
         wind_speed_interval_s=float(rain.get("wind_speed_interval_s", 8.0)),
         wind_speed_slew_per_s=float(rain.get("wind_speed_slew_per_s", 0.20)),
+        thunder_rate=float(rain.get("thunder_rate", 0.0)),
+        thunder_distance=float(rain.get("thunder_distance", 0.45)),
+        mix_thunder=float(rain.get("mix_thunder", data.get("mix", {}).get("thunder", 1.0))),
         mix_wash=float(
             rain.get("mix_wash", data.get("mix", {}).get("wash", MIX_WASH_RECOMMENDED))
         ),
@@ -191,6 +203,13 @@ def load_room(path: str) -> Room:
 
 
 def save_room(room: Room, path: str) -> None:
+    data = room_to_dict(room)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def room_to_dict(room: Room) -> Dict[str, Any]:
+    """The JSON-ready dict save_room writes (also sent to phones as-is)."""
     room.sync_all_windows()
     data = {
         "name": room.name,
@@ -201,6 +220,8 @@ def save_room(room: Room, path: str) -> None:
             "terrain_size": room.terrain_size,
             "roof_material": room.roof_material,
             "wall_material": room.wall_material,
+            "wall_thickness": float(getattr(room, "wall_thickness", 0.0) or 0.0),
+            "roof_thickness": float(getattr(room, "roof_thickness", 0.0) or 0.0),
             "name": room.name,
         },
         "listener": {
@@ -272,6 +293,9 @@ def save_room(room: Room, path: str) -> None:
             "wind_speed_interval_s": float(getattr(room, "wind_speed_interval_s", 8.0)),
             "wind_speed_slew_per_s": float(getattr(room, "wind_speed_slew_per_s", 0.20)),
             "thunder": room.thunder,
+            "thunder_rate": float(getattr(room, "thunder_rate", 0.0)),
+            "thunder_distance": float(getattr(room, "thunder_distance", 0.45)),
+            "mix_thunder": float(getattr(room, "mix_thunder", 1.0)),
             "droplet_density": room.droplet_density,
             "master_volume": float(getattr(room, "master_volume", 0.75)),
             "mix_wash": float(getattr(room, "mix_wash", MIX_WASH_RECOMMENDED)),
@@ -293,6 +317,7 @@ def save_room(room: Room, path: str) -> None:
             "reverb": float(getattr(room, "mix_reverb", MIX_REVERB_RECOMMENDED)),
             "wind": float(getattr(room, "mix_wind", MIX_WIND_RECOMMENDED)),
             "drips": float(getattr(room, "mix_drips", MIX_DRIPS_RECOMMENDED)),
+            "thunder": float(getattr(room, "mix_thunder", 1.0)),
             "master": float(getattr(room, "master_volume", 0.75)),
             "quantity": float(getattr(room, "droplet_density", 0.55)),
             "sharpness": float(getattr(room, "rain_intensity", 0.35)),
@@ -306,8 +331,7 @@ def save_room(room: Room, path: str) -> None:
             "weight": float(getattr(room, "tone_weight", TONE_WEIGHT_RECOMMENDED)),
         },
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    return data
 
 
 def new_default_room() -> Room:

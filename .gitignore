@@ -45,3 +45,18 @@ bin/
 # Secrets / local overrides
 .env
 .env.*
+
+# Phone rooms (per-user, written by the phone remote)
+configs/zones/
+
+# Phone sharing settings (on/off, pairing key) - per user
+configs/remote.json
+
+# Your own room (autosaved) and the presets you save - per user
+configs/my_house*.json
+configs/my_house.tmp
+configs/presets/*/
+
+# Local snapshots and scratch notes
+backups/
+docs/RELEASE_v*-wip.md

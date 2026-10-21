@@ -16,9 +16,11 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
+from app.graphics import lightning as ltg
+
 try:
     from OpenGL.GL import *
-    from OpenGL.GLU import gluPerspective, gluLookAt
+    from OpenGL.GLU import gluPerspective, gluLookAt, gluProject
     _HAS_GL = True
 except Exception:  # pragma: no cover
     _HAS_GL = False
@@ -46,6 +48,7 @@ def configure_gl_surface_format() -> None:
 class GLRoomView(QOpenGLWidget):
     cameraChanged = QtCore.Signal(float, float, float)
     selectionChanged = QtCore.Signal(tuple)
+    roomChanged = QtCore.Signal()   # a drag moved something (keeps the other panels in sync)
     requestRepaint = QtCore.Signal()
     glStatus = QtCore.Signal(str)
 
@@ -78,6 +81,9 @@ class GLRoomView(QOpenGLWidget):
         self._rain_verts = np.zeros((0, 3), dtype=np.float32)
         self._splashes = []
         self._max_particles = 2400
+        self.flash = 0.0  # lightning: 0 dark .. 1 full flash (set by the canvas)
+        self.strikes = []  # live lightning.Strike list (set by the canvas)
+        self._light = None  # (strength, direction) of the flash lighting the scene
         self._selection = PICK_NONE
         self._dragging = False
         self._mode = MODE_MOVE
@@ -261,9 +267,12 @@ class GLRoomView(QOpenGLWidget):
 
             self._apply_perspective()
             self._apply_cam()
+            self._light = ltg.scene_light(self.strikes) if self.strikes else None
 
             if self.room:
+                self._draw_sky_glow()
                 self._draw_terrain()
+                self._draw_lightning()
                 self._draw_house()
                 self._draw_windows()
                 self._draw_speakers()
@@ -324,6 +333,131 @@ class GLRoomView(QOpenGLWidget):
         glEnable(GL_DEPTH_TEST)
 
     # ---------- Scene ----------
+    def set_flash(self, v: float) -> None:
+        v = max(0.0, min(1.0, float(v)))
+        if abs(v - self.flash) > 0.004:
+            self.flash = v
+            self.update()
+
+    def set_lightning(self, strikes) -> None:
+        strikes = list(strikes or [])
+        if strikes or self.strikes:
+            self.strikes = strikes
+            self.update()
+
+    def _lc(self, rgb, a=None, normal=(0.0, 1.0, 0.0), ambient=0.3, reach=0.75):
+        """glColor with the lightning's light on a face facing ``normal``."""
+        if self._light is not None:
+            rgb = ltg.lit_rgb(rgb, ltg.face_boost(self._light, normal, ambient), reach)
+        if a is None:
+            glColor3f(*rgb)
+        else:
+            glColor4f(rgb[0], rgb[1], rgb[2], a)
+
+    def _draw_sky_glow(self):
+        """The sky brightens on the side the strike is (a far storm is only this)."""
+        if not self.strikes:
+            return
+        mv = glGetDoublev(GL_MODELVIEW_MATRIX)
+        pr = glGetDoublev(GL_PROJECTION_MATRIX)
+        vp = glGetIntegerv(GL_VIEWPORT)
+        W, H = max(1, self.width()), max(1, self.height())
+        # Viewport may be in device pixels; draw in the same units
+        vw, vh = float(vp[2]) or W, float(vp[3]) or H
+        spots = []
+        for s in self.strikes:
+            pt, alpha, rad = ltg.sky_glow(s, ltg.layout(s.az, s.km))
+            if alpha <= 0.01:
+                continue
+            # In front of the camera only
+            cx, cy, cz = self._cam_eye()
+            tx, ty, tz = self._target
+            if (pt[0] - cx) * (tx - cx) + (pt[1] - cy) * (ty - cy) + (pt[2] - cz) * (tz - cz) <= 0.0:
+                continue
+            try:
+                sx, sy, _sz = gluProject(pt[0], pt[1], pt[2], mv, pr, vp)
+            except Exception:
+                continue
+            spots.append((max(-0.2 * vw, min(1.2 * vw, sx)), max(vh * 0.4, min(vh, sy)), alpha, rad * vw))
+        if not spots:
+            return
+        glDisable(GL_DEPTH_TEST)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, vw, 0, vh, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        gr = ltg.GLOW_RGB
+        for x, y, alpha, r in spots:
+            glBegin(GL_TRIANGLE_FAN)
+            glColor4f(gr[0], gr[1], gr[2], 0.5 * alpha)
+            glVertex2f(x, y)
+            glColor4f(gr[0], gr[1], gr[2], 0.0)
+            for k in range(41):
+                a = 2.0 * math.pi * k / 40
+                glVertex2f(x + r * math.cos(a), y + r * math.sin(a))
+            glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glEnable(GL_DEPTH_TEST)
+
+    def _draw_lightning(self):
+        """Bolts on the horizon ring, their cloud glow, sheet lightning."""
+        if not self.strikes:
+            return
+        glDepthMask(GL_FALSE)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        try:
+            for s in self.strikes:
+                lay = ltg.layout(s.az, s.km)
+                H = lay["height"]
+                bx, _by, bz = lay["base"]
+                dx, _dy, dz = lay["dir"]
+                sx, _sy, sz = lay["side"]
+                # Cloud glow round the top (or the whole flash for a far storm)
+                g = s.glow * (0.35 + 0.65 * lay["near"])
+                if lay["sheet"]:
+                    g = min(1.0, g * 1.4 + 0.6 * s.bolt)
+                if g > 0.01:
+                    cx, cy, cz = bx - dx * 4.0, H * (0.92 if not lay["sheet"] else 0.75), bz - dz * 4.0
+                    rad = H * (0.55 if not lay["sheet"] else 0.9) + 6.0
+                    gr = ltg.GLOW_RGB
+                    glBegin(GL_TRIANGLE_FAN)
+                    glColor4f(gr[0], gr[1], gr[2], 0.55 * g)
+                    glVertex3f(cx, cy, cz)
+                    glColor4f(gr[0], gr[1], gr[2], 0.0)
+                    for k in range(33):
+                        a = 2.0 * math.pi * k / 32
+                        u, v = math.cos(a) * rad * 1.6, math.sin(a) * rad * 0.55
+                        glVertex3f(cx + sx * u, max(0.0, cy + v), cz + sz * u)
+                    glEnd()
+                vis = s.bolt * lay["channel"] * (0.45 + 0.55 * lay["near"])
+                if vis <= 0.01 or lay["sheet"]:
+                    continue
+                for pts, bright, width in ltg.bolt_shape(s.seed):
+                    wp = ltg.world_points(pts, lay)
+                    # Wide soft halo, then the white-hot core
+                    for lw, alpha, rgb in ((7.0 * width + 2.0, 0.16, ltg.GLOW_RGB),
+                                           (3.0 * width + 1.0, 0.35, ltg.GLOW_RGB),
+                                           (1.4 * width + 0.6, 1.0, ltg.CORE_RGB)):
+                        glLineWidth(lw * (0.6 + 0.4 * lay["near"]))
+                        glColor4f(rgb[0], rgb[1], rgb[2], min(1.0, alpha * vis * bright))
+                        glBegin(GL_LINE_STRIP)
+                        for x, y, z in wp:
+                            glVertex3f(float(x), float(y), float(z))
+                        glEnd()
+        finally:
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glDepthMask(GL_TRUE)
+            glLineWidth(1.0)
+
     def _draw_sky(self):
         w, h = max(1, self.width()), max(1, self.height())
         glDisable(GL_DEPTH_TEST)
@@ -334,11 +468,14 @@ class GLRoomView(QOpenGLWidget):
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
         glLoadIdentity()
+        k = 0.85 * max(0.0, min(1.0, float(self.flash)))
+        top = [c + (t - c) * k for c, t in zip((0.14, 0.20, 0.28), (0.80, 0.84, 0.94))]
+        bot = [c + (t - c) * k for c, t in zip((0.05, 0.07, 0.10), (0.55, 0.58, 0.66))]
         glBegin(GL_QUADS)
-        glColor3f(0.14, 0.20, 0.28)
+        glColor3f(*top)
         glVertex2f(0, h)
         glVertex2f(w, h)
-        glColor3f(0.05, 0.07, 0.10)
+        glColor3f(*bot)
         glVertex2f(w, 0)
         glVertex2f(0, 0)
         glEnd()
@@ -352,7 +489,7 @@ class GLRoomView(QOpenGLWidget):
         R = max(self.room.width, self.room.depth, 8.0) * 5.0
         # Ground
         glBegin(GL_QUADS)
-        glColor3f(0.14, 0.16, 0.14)
+        self._lc((0.14, 0.16, 0.14), ambient=0.6, reach=0.45)
         glVertex3f(-R, 0, -R)
         glVertex3f(R, 0, -R)
         glVertex3f(R, 0, R)
@@ -401,7 +538,7 @@ class GLRoomView(QOpenGLWidget):
 
         # Floor (opaque)
         glBegin(GL_QUADS)
-        glColor3f(0.22, 0.22, 0.26)
+        self._lc((0.22, 0.22, 0.26), ambient=0.6, reach=0.4)
         glVertex3f(x0, 0.0, z0)
         glVertex3f(x1, 0.0, z0)
         glVertex3f(x1, 0.0, z1)
@@ -410,23 +547,27 @@ class GLRoomView(QOpenGLWidget):
 
         # Walls — semi-transparent but brighter so they read clearly
         glBegin(GL_QUADS)
-        glColor4f(0.42, 0.44, 0.50, 0.55)
+        wall_rgb = (0.42, 0.44, 0.50)
         # +Z (north)
+        self._lc(wall_rgb, 0.55, (0.0, 0.0, 1.0))
         glVertex3f(x0, 0, z1)
         glVertex3f(x1, 0, z1)
         glVertex3f(x1, h, z1)
         glVertex3f(x0, h, z1)
         # -Z (south)
+        self._lc(wall_rgb, 0.55, (0.0, 0.0, -1.0))
         glVertex3f(x1, 0, z0)
         glVertex3f(x0, 0, z0)
         glVertex3f(x0, h, z0)
         glVertex3f(x1, h, z0)
         # +X (east)
+        self._lc(wall_rgb, 0.55, (1.0, 0.0, 0.0))
         glVertex3f(x1, 0, z1)
         glVertex3f(x1, 0, z0)
         glVertex3f(x1, h, z0)
         glVertex3f(x1, h, z1)
         # -X (west)
+        self._lc(wall_rgb, 0.55, (-1.0, 0.0, 0.0))
         glVertex3f(x0, 0, z0)
         glVertex3f(x0, 0, z1)
         glVertex3f(x0, h, z1)
@@ -456,7 +597,7 @@ class GLRoomView(QOpenGLWidget):
 
         # Simple flat roof
         glBegin(GL_QUADS)
-        glColor4f(0.35, 0.30, 0.28, 0.85)
+        self._lc((0.35, 0.30, 0.28), 0.85, (0.0, 1.0, 0.0), ambient=0.5)
         glVertex3f(x0 - 0.08, h, z0 - 0.08)
         glVertex3f(x1 + 0.08, h, z0 - 0.08)
         glVertex3f(x1 + 0.08, h, z1 + 0.08)
@@ -487,7 +628,10 @@ class GLRoomView(QOpenGLWidget):
             sill = float(getattr(win, "sill", 0.9))
             y0, y1 = sill, sill + float(win.height)
             open_a = 0.45 + 0.45 * max(0.0, min(1.0, float(getattr(win, "open", 0.7))))
-            glColor4f(0.35, 0.9, 1.0, open_a)
+            # Panes catch the flash: a brief cold glint
+            n = {"north": (0.0, 0.0, 1.0), "south": (0.0, 0.0, -1.0),
+                 "east": (1.0, 0.0, 0.0)}.get(wall, (-1.0, 0.0, 0.0))
+            self._lc((0.35, 0.9, 1.0), open_a, n, ambient=0.45, reach=0.95)
             glBegin(GL_QUADS)
             if wall == "north":
                 x0 = float(getattr(win, "offset", win.x)) - w * 0.5
@@ -677,6 +821,9 @@ class GLRoomView(QOpenGLWidget):
             elif k == "headphones":
                 x = self.room.headphones_items[i].x - self.room.width * 0.5
                 z = self.room.headphones_items[i].z - self.room.depth * 0.5
+            elif k == "listener":
+                x = self.room.listener.x - self.room.width * 0.5
+                z = self.room.listener.z - self.room.depth * 0.5
             elif k == "window":
                 win = self.room.windows[i]
                 x = (win.x + min(self.room.width, win.x + win.width)) * 0.5 - self.room.width * 0.5
@@ -882,15 +1029,21 @@ class GLRoomView(QOpenGLWidget):
         self.cameraChanged.emit(self.yaw, self.pitch, self.distance)
         self.update()
 
+    def set_tool(self, tool):
+        """Placement tools are not supported in this view (plan / 3D do that)."""
+        self.tool = tool
+
     def keyPressEvent(self, e):
         if e.key() == QtCore.Qt.Key_F or e.key() == QtCore.Qt.Key_Home:
             self.fit_camera()
-        if e.key() == QtCore.Qt.Key_W:
+        elif e.key() == QtCore.Qt.Key_W:
             self.set_transform_mode(MODE_MOVE)
-        if e.key() == QtCore.Qt.Key_E:
+        elif e.key() == QtCore.Qt.Key_E:
             self.set_transform_mode(MODE_ROT)
-        if e.key() == QtCore.Qt.Key_R:
+        elif e.key() == QtCore.Qt.Key_R:
             self.set_transform_mode(MODE_SCALE)
+        else:
+            e.ignore()  # Delete / Esc / Space reach the main window
 
     def _apply_transform_drag(self, pos):
         if not self.room:
@@ -904,15 +1057,26 @@ class GLRoomView(QOpenGLWidget):
         kind, idx = self._selection
         x = hx + self.room.width * 0.5
         z = hz + self.room.depth * 0.5
-        if kind == "speaker" and 0 <= idx < len(self.room.speakers):
-            if self._mode == MODE_MOVE:
+        moved = False
+        if self._mode == MODE_MOVE:
+            x, z = self.room.clamp_inside(x, z)
+            if kind == "speaker" and 0 <= idx < len(self.room.speakers):
                 self.room.speakers[idx].x, self.room.speakers[idx].z = x, z
-        elif kind == "headphones" and 0 <= idx < len(self.room.headphones_items):
-            if self._mode == MODE_MOVE:
+                moved = True
+            elif kind == "listener" or (kind == "headphones" and idx == 0):
+                self.room.listener.x, self.room.listener.z = x, z
+                if self.room.headphones_items:
+                    self.room.headphones_items[0].x = x
+                    self.room.headphones_items[0].z = z
+                moved = True
+            elif kind == "headphones" and 0 <= idx < len(self.room.headphones_items):
                 self.room.headphones_items[idx].x = x
                 self.room.headphones_items[idx].z = z
+                moved = True
         self.update()
         self.requestRepaint.emit()
+        if moved:
+            self.roomChanged.emit()
 
     def _try_select(self, pos):
         if not self.room:
@@ -942,7 +1106,12 @@ class GLRoomView(QOpenGLWidget):
             dist = math.hypot(hx - sx, hz - sz)
             if dist < best:
                 best = dist
-                sel = ("headphones", i)
+                sel = ("listener", 0) if i == 0 else ("headphones", i)
+        L = self.room.listener
+        dist = math.hypot(hx - (L.x - self.room.width * 0.5), hz - (L.z - self.room.depth * 0.5))
+        if dist < best:
+            best = dist
+            sel = ("listener", 0)
         self._selection = sel
         self.selectionChanged.emit(sel)
         self.update()

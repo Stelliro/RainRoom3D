@@ -13,6 +13,8 @@ from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from app.graphics import lightning as ltg
+
 Vec3 = Tuple[float, float, float]
 
 
@@ -33,15 +35,25 @@ class Room3DView(QtWidgets.QWidget):
     roomChanged = QtCore.Signal()
     cameraChanged = QtCore.Signal(float, float, float)
     statusMessage = QtCore.Signal(str)
+    placed = QtCore.Signal(str, int)  # a placement tool created / moved something
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(400, 300)
+        self.setMinimumSize(320, 240)
+        self.flash = 0.0  # lightning: 0 dark .. 1 full flash (set by the canvas)
+        self.strikes = []  # live lightning.Strike list (set by the canvas)
+        self._light = None  # (strength, direction) of the flash lighting the scene
+        # Floating chrome covers these margins: the view centre shifts into
+        # the free area and the compass stays clear of it.
+        self._insets = QtCore.QMargins(0, 0, 0, 0)
+        self._cx_off = 0.0
+        self._cy_off = 0.0
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setMouseTracking(True)
 
         self.room = None
         self.tool = "select"
+        self._annotations = True  # editing marks (hinge bars, opening arrows); off in Listen
         # Yaw: 0 = camera on +Z (north of house, looking south).
         # Default π + ε = south of house looking north → matches floor plan
         # (N far / top of view, E on the right).
@@ -117,15 +129,50 @@ class Room3DView(QtWidgets.QWidget):
 
     def set_tool(self, tool: str):
         self.tool = tool or "select"
-        hints = {
-            "select": "Select · gizmo arrows move · edges resize · RMB orbit",
-            "speaker": "Click inside the house (floor plane) to place a speaker",
-            "window": "Click a wall to place a window",
-            "listener": "Click to place You (listening position)",
-            "resize": "House resize is on the floor plan",
-        }
-        self.statusMessage.emit(hints.get(self.tool, f"Tool: {self.tool}"))
         self.update()
+
+    def set_annotations(self, on: bool) -> None:
+        """Design shows the editing marks (hinge edge, opening arrow); Listen
+        keeps just the house, the rain and a calm name · open % per window."""
+        self._annotations = bool(on)
+        self.update()
+
+    @staticmethod
+    def _halo_text(p: QtGui.QPainter, anchor: QtCore.QPointF, text: str, color: str) -> None:
+        """Text centred on ``anchor`` (its baseline 4 px above it) with a dark
+        halo, so it reads over glass, walls and rain alike."""
+        fm = p.fontMetrics()
+        x = anchor.x() - fm.horizontalAdvance(text) / 2.0
+        y = anchor.y() - 4.0
+        path = QtGui.QPainterPath()
+        path.addText(QtCore.QPointF(x, y), p.font(), text)
+        p.save()
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.setPen(QtGui.QPen(QtGui.QColor(8, 12, 18, 210), 3.5, QtCore.Qt.SolidLine,
+                            QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        p.drawPath(path)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(color))
+        p.drawPath(path)
+        p.restore()
+
+    def set_view_insets(self, left: int, top: int, right: int, bottom: int) -> None:
+        self._insets = QtCore.QMargins(int(left), int(top), int(right), int(bottom))
+        self._update_center_offset()
+        self.update()
+
+    def _update_center_offset(self) -> None:
+        m = self._insets
+        if self.width() - m.left() - m.right() < 160 or self.height() - m.top() - m.bottom() < 160:
+            self._cx_off = self._cy_off = 0.0
+            return
+        self._cx_off = (m.left() - m.right()) * 0.5
+        self._cy_off = (m.top() - m.bottom()) * 0.5
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._update_center_offset()
 
     def _retarget(self):
         if self.room:
@@ -205,8 +252,8 @@ class Room3DView(QtWidgets.QWidget):
         ndc_x = (cx * sx) / cz
         ndc_y = (cy * sy) / cz
         # to pixels (y down)
-        px = (ndc_x * 0.5 + 0.5) * self.width()
-        py = (1.0 - (ndc_y * 0.5 + 0.5)) * self.height()
+        px = (ndc_x * 0.5 + 0.5) * self.width() + self._cx_off
+        py = (1.0 - (ndc_y * 0.5 + 0.5)) * self.height() + self._cy_off
         return QtCore.QPointF(px, py)
 
     def _poly(self, pts: List[Vec3]) -> Optional[QtGui.QPolygonF]:
@@ -225,15 +272,26 @@ class Room3DView(QtWidgets.QWidget):
 
         # Background sky gradient
         grad = QtGui.QLinearGradient(0, 0, 0, self.height())
-        grad.setColorAt(0.0, QtGui.QColor("#1a2740"))
-        grad.setColorAt(0.55, QtGui.QColor("#0f1724"))
-        grad.setColorAt(1.0, QtGui.QColor("#0a1018"))
+        fl = max(0.0, min(1.0, float(self.flash)))
+
+        def sky(hex_col: str) -> QtGui.QColor:
+            # Lightning washes the sky toward a cold white
+            c = QtGui.QColor(hex_col)
+            k = 0.85 * fl
+            return QtGui.QColor(int(c.red() + (205 - c.red()) * k), int(c.green() + (215 - c.green()) * k),
+                                int(c.blue() + (240 - c.blue()) * k))
+
+        grad.setColorAt(0.0, sky("#1a2740"))
+        grad.setColorAt(0.55, sky("#0f1724"))
+        grad.setColorAt(1.0, sky("#0a1018"))
         p.fillRect(self.rect(), grad)
 
         if not self.room:
             p.setPen(QtGui.QColor("#94a3b8"))
             p.drawText(self.rect(), QtCore.Qt.AlignCenter, "No house loaded")
             return
+        self._light = ltg.scene_light(self.strikes) if self.strikes else None
+        self._draw_sky_glow(p)
 
         w = float(self.room.width)
         d = float(self.room.depth)
@@ -251,7 +309,7 @@ class Room3DView(QtWidgets.QWidget):
         terr = [(-R, 0, -R), (R, 0, -R), (R, 0, R), (-R, 0, R)]
         poly = self._poly(terr)
         if poly:
-            p.setBrush(QtGui.QColor("#14301f"))
+            p.setBrush(self._lit(QtGui.QColor("#14301f"), (0.0, 1.0, 0.0), 0.6, 0.45))
             p.setPen(QtGui.QPen(QtGui.QColor("#1f4a32"), 1))
             p.drawPolygon(poly)
 
@@ -271,6 +329,9 @@ class Room3DView(QtWidgets.QWidget):
                 p.drawLine(a, b)
             x += step
 
+        # Lightning on the horizon (behind the house)
+        self._draw_lightning(p)
+
         # House box corners (centred)
         x0, z0 = -w * 0.5, -d * 0.5
         x1, z1 = w * 0.5, d * 0.5
@@ -287,13 +348,13 @@ class Room3DView(QtWidgets.QWidget):
         # Walls (semi-transparent faces, painter order: far first roughly by camera)
         faces = [
             # -Z south
-            ([bot[0], bot[1], top[1], top[0]], QtGui.QColor(70, 85, 110, 160)),
+            ([bot[0], bot[1], top[1], top[0]], self._lit(QtGui.QColor(70, 85, 110, 160), (0.0, 0.0, -1.0))),
             # +Z north
-            ([bot[2], bot[3], top[3], top[2]], QtGui.QColor(80, 100, 130, 150)),
+            ([bot[2], bot[3], top[3], top[2]], self._lit(QtGui.QColor(80, 100, 130, 150), (0.0, 0.0, 1.0))),
             # +X east
-            ([bot[1], bot[2], top[2], top[1]], QtGui.QColor(65, 80, 105, 150)),
+            ([bot[1], bot[2], top[2], top[1]], self._lit(QtGui.QColor(65, 80, 105, 150), (1.0, 0.0, 0.0))),
             # -X west
-            ([bot[3], bot[0], top[0], top[3]], QtGui.QColor(75, 90, 115, 150)),
+            ([bot[3], bot[0], top[0], top[3]], self._lit(QtGui.QColor(75, 90, 115, 150), (-1.0, 0.0, 0.0))),
         ]
         # Sort by average depth (farther first)
         eye = self._eye()
@@ -314,7 +375,7 @@ class Room3DView(QtWidgets.QWidget):
         # Roof outline
         poly = self._poly(top)
         if poly:
-            p.setBrush(QtGui.QColor(50, 58, 72, 100))
+            p.setBrush(self._lit(QtGui.QColor(50, 58, 72, 100), (0.0, 1.0, 0.0), 0.5))
             p.setPen(QtGui.QPen(QtGui.QColor("#9bb4d0"), 2))
             p.drawPolygon(poly)
 
@@ -351,15 +412,120 @@ class Room3DView(QtWidgets.QWidget):
         # Compass (matches floor plan: N = +Z, E = +X)
         self._draw_compass(p)
 
-        # HUD
-        p.setPen(QtGui.QColor("#94a3b8"))
-        p.drawText(
-            12,
-            self.height() - 14,
-            "LMB: select/edit · tools place · RGB arrows move · edges resize · RMB: orbit · F: fit",
-        )
-        p.setPen(QtGui.QColor("#e2e8f0"))
-        p.drawText(12, 22, f"{getattr(self.room, 'name', 'House')}  ·  {w:.1f}×{d:.1f}×{h:.1f} m")
+        # (Controls hint + house title live in the floating studio chrome.)
+        if fl > 0.01:
+            # Everything lit for an instant
+            p.fillRect(self.rect(), QtGui.QColor(215, 225, 255, int(70 * fl)))
+
+    def set_lightning(self, strikes) -> None:
+        strikes = list(strikes or [])
+        if strikes or self.strikes:
+            self.strikes = strikes
+            self.update()
+
+    def _lit(self, c: QtGui.QColor, normal: Vec3, ambient: float = 0.3, reach: float = 0.75) -> QtGui.QColor:
+        """``c`` with the lightning's light on a face facing ``normal``."""
+        if self._light is None:
+            return c
+        r, g, b = ltg.lit_rgb((c.redF(), c.greenF(), c.blueF()), ltg.face_boost(self._light, normal, ambient), reach)
+        return QtGui.QColor.fromRgbF(r, g, b, c.alphaF())
+
+    def _draw_sky_glow(self, p: QtGui.QPainter) -> None:
+        """The sky brightens on the side the strike is (a far storm is only this)."""
+        if not self.strikes:
+            return
+        p.save()
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
+        p.setPen(QtCore.Qt.NoPen)
+        W, Hh = float(self.width()), float(self.height())
+        for s in self.strikes:
+            pt, alpha, rad = ltg.sky_glow(s, ltg.layout(s.az, s.km))
+            q = self._project(pt)
+            if q is None or alpha <= 0.01:
+                continue
+            c = QtCore.QPointF(max(-0.2 * W, min(1.2 * W, q.x())), max(0.0, min(Hh * 0.6, q.y())))
+            r = rad * W
+            gr = ltg.GLOW_RGB
+            grad = QtGui.QRadialGradient(c, r)
+            grad.setColorAt(0.0, QtGui.QColor.fromRgbF(gr[0], gr[1], gr[2], 0.5 * alpha))
+            grad.setColorAt(0.5, QtGui.QColor.fromRgbF(gr[0], gr[1], gr[2], 0.18 * alpha))
+            grad.setColorAt(1.0, QtGui.QColor.fromRgbF(gr[0], gr[1], gr[2], 0.0))
+            p.setBrush(QtGui.QBrush(grad))
+            p.drawRect(self.rect())
+        p.restore()
+
+    def _draw_lightning(self, p: QtGui.QPainter) -> None:
+        """Bolts on the horizon ring, their cloud glow, sheet lightning."""
+        if not self.strikes:
+            return
+        p.save()
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
+        p.setBrush(QtCore.Qt.NoBrush)
+        for s in self.strikes:
+            lay = ltg.layout(s.az, s.km)
+            H = lay["height"]
+            bx, _by, bz = lay["base"]
+            dx, _dy, dz = lay["dir"]
+            sx, _sy, sz = lay["side"]
+            # Cloud glow round the top (or the whole flash for a far storm)
+            g = s.glow * (0.35 + 0.65 * lay["near"])
+            if lay["sheet"]:
+                g = min(1.0, g * 1.4 + 0.6 * s.bolt)
+            if g > 0.01:
+                cy = H * (0.92 if not lay["sheet"] else 0.75)
+                c = (bx - dx * 4.0, cy, bz - dz * 4.0)
+                rad = H * (0.55 if not lay["sheet"] else 0.9) + 6.0
+                pc = self._project(c)
+                pe = self._project((c[0] + sx * rad * 1.6, cy, c[2] + sz * rad * 1.6))
+                pv = self._project((c[0], cy + rad * 0.55, c[2]))
+                if pc is not None and pe is not None and pv is not None:
+                    rx = max(8.0, math.hypot(pe.x() - pc.x(), pe.y() - pc.y()))
+                    ry = max(5.0, math.hypot(pv.x() - pc.x(), pv.y() - pc.y()))
+                    gr = ltg.GLOW_RGB
+                    grad = QtGui.QRadialGradient(pc, rx)
+                    grad.setColorAt(0.0, QtGui.QColor.fromRgbF(gr[0], gr[1], gr[2], min(1.0, 0.55 * g)))
+                    grad.setColorAt(1.0, QtGui.QColor.fromRgbF(gr[0], gr[1], gr[2], 0.0))
+                    p.save()
+                    p.translate(pc)
+                    p.scale(1.0, ry / rx)
+                    p.translate(-pc)
+                    p.setPen(QtCore.Qt.NoPen)
+                    p.setBrush(QtGui.QBrush(grad))
+                    p.drawEllipse(pc, rx, rx)
+                    p.restore()
+            vis = s.bolt * lay["channel"] * (0.45 + 0.55 * lay["near"])
+            if vis <= 0.01 or lay["sheet"]:
+                continue
+            k = 0.6 + 0.4 * lay["near"]
+            for pts, bright, width in ltg.bolt_shape(s.seed):
+                path = QtGui.QPainterPath()
+                pen_down = False
+                for x, y, z in ltg.world_points(pts, lay):
+                    q = self._project((float(x), float(y), float(z)))
+                    if q is None:
+                        pen_down = False
+                    elif pen_down:
+                        path.lineTo(q)
+                    else:
+                        path.moveTo(q)
+                        pen_down = True
+                # Wide soft halo, then the white-hot core
+                for lw, alpha, rgb in ((7.0 * width + 2.0, 0.16, ltg.GLOW_RGB),
+                                       (3.0 * width + 1.0, 0.35, ltg.GLOW_RGB),
+                                       (1.4 * width + 0.6, 1.0, ltg.CORE_RGB)):
+                    pen = QtGui.QPen(QtGui.QColor.fromRgbF(rgb[0], rgb[1], rgb[2], min(1.0, alpha * vis * bright)),
+                                     lw * k)
+                    pen.setCapStyle(QtCore.Qt.RoundCap)
+                    pen.setJoinStyle(QtCore.Qt.RoundJoin)
+                    p.setPen(pen)
+                    p.drawPath(path)
+        p.restore()
+
+    def set_flash(self, v: float) -> None:
+        v = max(0.0, min(1.0, float(v)))
+        if abs(v - self.flash) > 0.004:
+            self.flash = v
+            self.update()
 
     def _draw_compass(self, p: QtGui.QPainter):
         """Screen-space compass using the same axes as the floor plan."""
@@ -369,8 +535,8 @@ class Room3DView(QtWidgets.QWidget):
         o = self._project(origin)
         n = self._project(north)
         e = self._project(east)
-        cx = self.width() - 52
-        cy = 52
+        cx = self.width() - self._insets.right() - 48
+        cy = self.height() - self._insets.bottom() - 48
         if o and n and e:
             ndx, ndy = n.x() - o.x(), n.y() - o.y()
             edx, edy = e.x() - o.x(), e.y() - o.y()
@@ -449,7 +615,10 @@ class Room3DView(QtWidgets.QWidget):
 
         # Frame (closed glass outline) — dimmer when open
         frame_a = int(50 + 40 * (1.0 - o))
-        p.setBrush(QtGui.QColor(40, 70, 90, frame_a))
+        # Panes catch the flash: a brief cold glint
+        nrm = self._window_outward_unit(win)
+        glint = ltg.face_boost(self._light, nrm, 0.45)
+        p.setBrush(self._lit(QtGui.QColor(40, 70, 90, int(frame_a + 120 * min(1.0, glint))), nrm, 0.45, 0.95))
         p.setPen(QtGui.QPen(QtGui.QColor("#5eead4" if not selected else "#f0fdfa"), 2 if not selected else 3))
         p.drawPolygon(QtGui.QPolygonF(frame))
 
@@ -468,32 +637,23 @@ class Room3DView(QtWidgets.QWidget):
                 p.setBrush(QtGui.QColor(100, 230, 245, int(120 + 100 * o)))
                 p.setPen(QtGui.QPen(QtGui.QColor("#67e8f9"), 2.5))
                 p.drawPolygon(QtGui.QPolygonF(sash_pts))
-                # Hinge edge highlight
-                hinge_i = self._window_hinge_edge_indices(win)
+                # Hinge edge highlight (Design only; the amber bar is the hinge)
+                hinge_i = self._window_hinge_edge_indices(win) if self._annotations else None
                 if hinge_i is not None:
                     i0, i1 = hinge_i
                     p.setPen(QtGui.QPen(QtGui.QColor("#fbbf24"), 4))
                     p.drawLine(sash_pts[i0], sash_pts[i1])
-                    mid = QtCore.QPointF(
-                        0.5 * (sash_pts[i0].x() + sash_pts[i1].x()),
-                        0.5 * (sash_pts[i0].y() + sash_pts[i1].y()),
-                    )
-                    p.setPen(QtGui.QColor("#fde68a"))
-                    p.drawText(mid.toPoint() + QtCore.QPoint(4, -4), "hinge")
 
         # Opening arrow (from frame into open direction)
-        self._draw_window_open_arrow(p, win, frame)
+        if self._annotations:
+            self._draw_window_open_arrow(p, win, frame)
 
-        # Label
-        style = getattr(win, "open_style", "") or ""
-        draw_style = win.resolved_style_for_draw() if hasattr(win, "resolved_style_for_draw") else style
-        hinge = win.resolved_hinge_side() if hasattr(win, "resolved_hinge_side") else getattr(win, "hinge_side", "")
-        p.setPen(QtGui.QColor("#ccfbf1"))
-        p.drawText(
-            frame[3].toPoint() + QtCore.QPoint(4, -4),
-            f"{win.name}  {int(o * 100)}%  {style}"
-            + (f" → {draw_style}/{hinge}" if style == "custom" else f" · {hinge}"),
-        )
+        # Label: centred above the window's top edge (never across the pane)
+        top_y = min(q.y() for q in frame)
+        cx = 0.5 * (frame[2].x() + frame[3].x())
+        self._halo_text(p, QtCore.QPointF(cx, top_y - 4.0),
+                        f"{win.name} · " + ("closed" if o <= 0.005 else f"{int(round(o * 100))}% open"),
+                        "#ccfbf1")
 
         # Resize handles + move gizmo when selected
         if selected:
@@ -505,11 +665,6 @@ class Room3DView(QtWidgets.QWidget):
                 p.drawEllipse(hp, _HANDLE_R, _HANDLE_R)
             cx, cy, cz = self.room.window_center(win)
             self._draw_gizmo(p, (cx, cy, cz), prefix="win")
-            p.setPen(QtGui.QColor("#94a3b8"))
-            p.drawText(
-                frame[1].toPoint() + QtCore.QPoint(6, 14),
-                "edges=resize · RGB arrows=move (can stick past wall)",
-            )
 
     def _window_hinge_edge_indices(self, win) -> Optional[Tuple[int, int]]:
         """Indices into sash corners (BL,BR,TR,TL) for the hinge edge."""
@@ -820,7 +975,7 @@ class Room3DView(QtWidgets.QWidget):
             p.setPen(QtGui.QColor("#fde68a"))
             p.drawText(
                 mid.toPoint() + QtCore.QPoint(8, 4),
-                f"{spk.name}  W{bw:.2f}×H{bh:.2f}×D{bd:.2f}",
+                spk.name,
             )
 
         if selected:
@@ -838,12 +993,6 @@ class Room3DView(QtWidgets.QWidget):
                 p.setBrush(col)
                 p.setPen(QtGui.QPen(QtGui.QColor("#0f172a"), 1.5))
                 p.drawRect(QtCore.QRectF(hp.x() - 5, hp.y() - 5, 10, 10))
-            if mid:
-                p.setPen(QtGui.QColor("#94a3b8"))
-                p.drawText(
-                    mid.toPoint() + QtCore.QPoint(8, 18),
-                    "arrows=move · red W · green H · blue D  (wide = soundbar range)",
-                )
 
     def _speaker_size_handles(self, spk) -> dict:
         bw, bh, bd = self._spk_dims(spk)
@@ -1339,6 +1488,7 @@ class Room3DView(QtWidgets.QWidget):
             f[0] * r[1] - f[1] * r[0],
         )
         w, h = max(1, self.width()), max(1, self.height())
+        sx, sy = sx - self._cx_off, sy - self._cy_off
         nx = (2.0 * sx / w) - 1.0
         ny = 1.0 - (2.0 * sy / h)
         fov = math.radians(50.0)
@@ -1552,7 +1702,8 @@ class Room3DView(QtWidgets.QWidget):
             self.room.speakers.append(sp)
             self.set_selection("speaker", n, emit=True)
             self.roomChanged.emit()
-            self.statusMessage.emit(f"Placed {sp.name} in 3D")
+            self.statusMessage.emit(f"Placed {sp.name} — pick its device in the inspector")
+            self.placed.emit("speaker", n)
             return True
         if tool == "window":
             # Prefer wall under ray
@@ -1584,7 +1735,8 @@ class Room3DView(QtWidgets.QWidget):
             self.room.sync_window_coords(win)
             self.set_selection("window", n, emit=True)
             self.roomChanged.emit()
-            self.statusMessage.emit(f"Placed {win.name} on {best_wall}")
+            self.statusMessage.emit(f"Placed {win.name} on the {best_wall} wall")
+            self.placed.emit("window", n)
             return True
         if tool == "listener":
             hit = self._intersect_y_plane(float(self.room.listener.y), sx, sy)
@@ -1599,6 +1751,7 @@ class Room3DView(QtWidgets.QWidget):
             self.set_selection("listener", 0, emit=True)
             self.roomChanged.emit()
             self.statusMessage.emit("Moved You")
+            self.placed.emit("listener", 0)
             return True
         return False
 
@@ -1866,14 +2019,9 @@ class Room3DView(QtWidgets.QWidget):
         self.update()
 
     def keyPressEvent(self, e: QtGui.QKeyEvent):
-        if e.key() in (QtCore.Qt.Key_F, QtCore.Qt.Key_Home):
+        if e.key() == QtCore.Qt.Key_Home:
             self.fit_camera()
-        elif e.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
-            kind, idx = self._selection
-            if kind == "window" and 0 <= idx < len(self.room.windows):
-                name = self.room.windows[idx].name
-                del self.room.windows[idx]
-                self.set_selection("none", -1, emit=True)
-                self.roomChanged.emit()
-                self.statusMessage.emit(f"Removed {name}")
-                self.update()
+            return
+        # Delete / Esc / F / tool keys are handled once, by the main window
+        # (Delete now removes windows and speakers alike).
+        e.ignore()

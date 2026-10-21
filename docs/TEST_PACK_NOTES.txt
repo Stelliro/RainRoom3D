@@ -1,1 +1,0 @@
-Render single-instance droplets for all materials and sizes, plus a deterministic thunder event. No noise generators are used.

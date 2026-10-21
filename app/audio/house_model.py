@@ -25,7 +25,7 @@ hand-tuned layer gains.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 # ----- materials -----
@@ -55,6 +55,23 @@ MATERIALS: Dict[str, MaterialAcoustics] = {
     "water": MaterialAcoustics("water", 0.32, 0.0, 0.0, 0.0),
 }
 
+# The numbers above are for each material's usual build; these are those
+# thicknesses (m). A thicker wall or roof is heavier, stiffer and damped
+# more: what gets through falls ~9 dB per doubling (mass law plus the
+# losses of a deeper build) and loses its top end, so a very thick one
+# mutes the rain. Glazing is the pane itself.
+TYPICAL_THICKNESS_M = {
+    "tin": 0.01, "metal": 0.01, "tile": 0.12, "shingle": 0.10,
+    "glass": 0.012, "wood": 0.12, "brick": 0.23, "water": 0.01,
+}
+# Roofs: the sheet / deck you hear from inside
+TYPICAL_ROOF_M = {
+    "tin": 0.005, "metal": 0.008, "tile": 0.15, "shingle": 0.15,
+    "glass": 0.012, "wood": 0.12, "brick": 0.23, "water": 0.01,
+}
+THICKNESS_MIN_M, THICKNESS_MAX_M = 0.002, 1.50
+THICKNESS_EXP = 1.5
+
 # Ground ring catchment (matches the 3D view's eaves ring)
 RING_IN_M = 0.12
 RING_OUT_M = 0.85
@@ -83,11 +100,81 @@ def material(name: Optional[str], default: str = "brick") -> MaterialAcoustics:
 
 
 def roof_material(room) -> MaterialAcoustics:
-    return material(getattr(room, "roof_material", None), "metal")
+    """The roof's acoustics at the room's roof thickness."""
+    return _thicker(material(getattr(room, "roof_material", None), "metal"), roof_mass_k(room))
+
+
+def typical_wall_thickness(room) -> float:
+    return TYPICAL_THICKNESS_M[material_key(getattr(room, "wall_material", None), "brick")]
+
+
+def typical_roof_thickness(room) -> float:
+    return TYPICAL_ROOF_M[material_key(getattr(room, "roof_material", None), "metal")]
+
+
+def _thickness(room, attr: str, typical: float) -> float:
+    t = float(getattr(room, attr, 0.0) or 0.0)
+    if t <= 0.0:
+        return typical
+    return max(THICKNESS_MIN_M, min(THICKNESS_MAX_M, t))
+
+
+def wall_thickness(room) -> float:
+    """Wall thickness in m (0 / unset on the room = usual for its material)."""
+    return _thickness(room, "wall_thickness", typical_wall_thickness(room))
+
+
+def roof_thickness(room) -> float:
+    """Roof thickness in m (0 / unset = usual for its material)."""
+    return _thickness(room, "roof_thickness", typical_roof_thickness(room))
+
+
+def thickness_k(typical: float, t: float) -> float:
+    """Amplitude through a build ``t`` thick relative to its usual one."""
+    return max(1e-4, min(4.0, (typical / max(1e-6, t)) ** THICKNESS_EXP))
+
+
+def wall_mass_k(room) -> float:
+    return thickness_k(typical_wall_thickness(room), wall_thickness(room))
+
+
+def roof_mass_k(room) -> float:
+    return thickness_k(typical_roof_thickness(room), roof_thickness(room))
+
+
+def glazing_k(room) -> float:
+    """Closed windows are fitted to the wall: a thick wall gets heavy
+    glazing (half the wall's change, in dB)."""
+    return math.sqrt(wall_mass_k(room))
+
+
+def _thicker(m: MaterialAcoustics, k: float) -> MaterialAcoustics:
+    if abs(k - 1.0) < 1e-9:
+        return m
+    # Less gets through, and what does loses its top end first
+    return replace(m, impact=m.impact * k, airborne=m.airborne * k,
+                   lp_hz=max(60.0, m.lp_hz * min(1.0, k) ** 0.5))
 
 
 def wall_material(room) -> MaterialAcoustics:
-    return material(getattr(room, "wall_material", None), "brick")
+    """The walls' acoustics at the room's wall thickness."""
+    return _thicker(material(getattr(room, "wall_material", None), "brick"), wall_mass_k(room))
+
+
+def glass_material(room) -> MaterialAcoustics:
+    """A closed window pane, glazed to suit the wall."""
+    return _thicker(MATERIALS["glass"], glazing_k(room))
+
+
+def reveal_fraction(depth: float, width: float, height: float, tan_lat: float, tan_vert: float) -> float:
+    """Share of an opening ``width`` × ``height`` set ``depth`` deep in the
+    wall that's still in view from a direction tilted tan_lat / tan_vert off
+    its axis (the reveal hides the rest)."""
+    if depth <= 0.0:
+        return 1.0
+    fl = max(0.0, 1.0 - depth * abs(tan_lat) / max(0.05, width))
+    fv = max(0.0, 1.0 - depth * abs(tan_vert) / max(0.05, height))
+    return fl * fv
 
 
 def surface_radiate(surface: str) -> float:
@@ -289,5 +376,7 @@ def pick_patch(patches: Sequence[Patch], rng, kind: Optional[int] = None) -> Opt
 __all__ = [
     "MATERIALS", "MaterialAcoustics", "Patch", "catchments", "catchment_area", "facade_tilt",
     "kind_shares", "layer_shares", "material", "material_key", "pick_patch", "roof_material",
-    "sample_point", "surface_radiate", "wall_contact", "wall_material", "wall_point", "window_span",
+    "glass_material", "glazing_k", "reveal_fraction", "roof_mass_k", "roof_thickness", "sample_point",
+    "surface_radiate", "thickness_k", "typical_roof_thickness", "typical_wall_thickness", "wall_contact",
+    "wall_mass_k", "wall_material", "wall_point", "wall_thickness", "window_span",
 ]

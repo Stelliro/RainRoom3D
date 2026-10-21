@@ -27,11 +27,32 @@ if (Test-Path $BuildDir) {
     Remove-Item -Recurse -Force $BuildDir
 }
 
+# configs/ minus this PC's own phone settings: remote.json holds the phone
+# pairing key and whether sharing is on, zones/ holds phone rooms. Neither may
+# ship, or every copy of the release would open the phone server at start.
+$ConfigsStage = Join-Path $env:TEMP "RainRoom3D_configs_stage"
+if (Test-Path $ConfigsStage) { Remove-Item -Recurse -Force $ConfigsStage }
+New-Item -ItemType Directory -Force -Path $ConfigsStage | Out-Null
+Get-ChildItem -Path (Join-Path $Root "configs") -Force | Where-Object {
+    $_.Name -notin @("remote.json", "remote.json.tmp", "zones")
+} | ForEach-Object { Copy-Item -Recurse -Force $_.FullName (Join-Path $ConfigsStage $_.Name) }
+# Nor this PC's own room (the autosave) or saved presets: a fresh copy starts
+# from the default house with only the example houses and built-in presets.
+Get-ChildItem -Path $ConfigsStage -Filter "my_house*.json" -File | Remove-Item -Force
+Get-ChildItem -Path (Join-Path $ConfigsStage "presets") -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne ".gitkeep" } | Remove-Item -Force
+
+$Version = (python -c "from app.version import __version__; print(__version__)").Trim()
+if (-not $Version) { throw "Could not read app/version.py" }
+Write-Host "Building $Name $Version"
+
 # Data folders to bundle
 $AddData = @(
-    "configs;configs",
+    "$ConfigsStage;configs",
     "assets;assets",
-    "docs/media;docs/media"
+    "docs/media;docs/media",
+    # the phone web app (served by app/remote/server.py from _MEIPASS)
+    "app/remote/web;app/remote/web"
 )
 
 # Heavy / unused packages often present in a workstation Python env
@@ -45,7 +66,7 @@ $Exclude = @(
     "pandas", "pyarrow", "polars",
     "matplotlib", "mpl_toolkits", "matplotlib_inline", "contourpy", "kiwisolver", "cycler", "fontTools",
     "IPython", "jupyter", "notebook", "nbformat", "nbconvert",
-    "pytest", "unittest", "_pytest",
+    "pytest", "_pytest",  # not unittest: numpy.testing (loaded lazily while rendering) needs it
     "black", "mypy", "ruff",
     "sympy", "networkx",
     "h5py", "tables",
@@ -93,6 +114,14 @@ if (-not (Test-Path $Exe)) {
 }
 Write-Host "Built: $Exe"
 
+# The phone web app must be inside the bundle, or phones get "Not found"
+$WebIndex = Join-Path $Onedir "_internal/app/remote/web/index.html"
+if (-not (Test-Path $WebIndex)) { throw "Build is missing the phone web app: $WebIndex" }
+foreach ($leak in @("_internal/configs/remote.json", "_internal/configs/zones", "_internal/configs/my_house.json",
+                    "_internal/configs/presets/house/my-house.json")) {
+    if (Test-Path (Join-Path $Onedir $leak)) { throw "Build would ship this PC's phone settings: $leak" }
+}
+
 # ---- Post-strip: CUDA / ML leftovers that snuck in via DLL dependency scan ----
 function Remove-BloatFromTree([string]$Path) {
     if (-not (Test-Path $Path)) { return 0 }
@@ -134,15 +163,16 @@ Write-Host ("Stripped {0:N1} MB of bloat" -f ($stripped / 1MB))
 # Ship license + readme next to exe
 Copy-Item -Force (Join-Path $Root "LICENSE") (Join-Path $Onedir "LICENSE") -ErrorAction SilentlyContinue
 Copy-Item -Force (Join-Path $Root "README.md") (Join-Path $Onedir "README.md") -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $Root "CHANGELOG.md") (Join-Path $Onedir "CHANGELOG.md") -ErrorAction SilentlyContinue
 # Ensure configs/assets exist at top level too (some launches use cwd)
-Copy-Item -Force -Recurse (Join-Path $Root "configs") (Join-Path $Onedir "configs") -ErrorAction SilentlyContinue
+Copy-Item -Force -Recurse $ConfigsStage (Join-Path $Onedir "configs") -ErrorAction SilentlyContinue
 Copy-Item -Force -Recurse (Join-Path $Root "assets") (Join-Path $Onedir "assets") -ErrorAction SilentlyContinue
 
 $total = (Get-ChildItem $Onedir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
 Write-Host ("Portable folder size: {0:N1} MB  ($Onedir)" -f ($total / 1MB))
 
 # Zip for GitHub Releases
-$ZipName = "RainRoom3D-windows-portable.zip"
+$ZipName = "RainRoom3D-$Version-windows-portable.zip"
 $ZipPath = Join-Path $DistDir $ZipName
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 Write-Host "Zipping $ZipPath ..."

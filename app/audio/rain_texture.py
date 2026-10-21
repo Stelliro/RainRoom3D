@@ -94,13 +94,25 @@ class DenseRainTexture:
         # Above the cap, the share of the missing grains' energy put back as
         # louder grains (1) or as a continuous roar of the same grains (0).
         self.hit_makeup = 1.0
+        # Low-band fusing: a dense sheet's low end is one smooth rumble, not
+        # separate plops. Below ``fuse_hz`` the grains' share fades into a
+        # roar as the per-stem rate climbs from ``fuse_from`` to ``fuse_full``
+        # drops/s; above it they stay separate ticks. Stacked water "blubs"
+        # (a few dozen grains, a few pitches) otherwise boil. 0 = off.
+        self.fuse_hz = 0.0
+        self.fuse_from = 150.0
+        self.fuse_full = 600.0
         self.rng = np.random.RandomState(int(seed) & 0x7FFFFFFF)
         self._bed_rng = np.random.default_rng(int(seed) + 1)
         # source → (sizes_mm[S], kernels[S * V]) — V variants per size, bin-major
         self._kernels: Dict[str, Tuple[np.ndarray, List[np.ndarray]]] = {}
-        self._kfft: Dict[Tuple[str, int], Tuple[int, np.ndarray]] = {}
         # (source, stem) → convolution tail carried into the next block
         self._tails: Dict[Tuple[str, int], np.ndarray] = {}
+        # alias source → source whose grains (and their FFTs) it reuses
+        self._alias: Dict[str, str] = {}
+        # source → padded kernel matrix; roar filters by (source, sizes, dist)
+        self._kmat: Dict[object, np.ndarray] = {}
+        self._bed_cache: Dict[tuple, dict] = {}
 
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
@@ -121,24 +133,123 @@ class DenseRainTexture:
         if len(sizes) == 0 or len(ks) % len(sizes):
             raise ValueError("kernels must be a whole number of variants per size")
         self._kernels[source] = (sizes, ks)
-        for key in [k for k in self._kfft if k[0] == source]:
-            del self._kfft[key]
+        self._alias.pop(source, None)
+        self._forget(source)
+
+    def share_kernels(self, alias: str, source: str) -> None:
+        """``alias`` renders with ``source``'s grains, sharing their FFTs."""
+        self._kernels[alias] = self._kernels[source]
+        self._alias[alias] = source
+        self._forget(alias)
+
+    def _forget(self, source: str) -> None:
+        for key in [k for k in self._kmat if k == source or (isinstance(k, tuple) and k[0] == source)]:
+            del self._kmat[key]
+        for key in [k for k in self._bed_cache if k[0] == source]:
+            del self._bed_cache[key]
 
     def has_source(self, source: str) -> bool:
         return source in self._kernels
 
-    def _kernel_fft(self, source: str, nfft: int) -> np.ndarray:
-        cached = self._kfft.get((source, 0))
-        if cached is not None and cached[0] == nfft:
-            return cached[1]
+    def _kernel_matrix(self, source: str) -> np.ndarray:
+        """All of a source's grains, zero-padded to one length: (kernels, len)."""
+        source = self._alias.get(source, source)
+        cached = self._kmat.get(source)
+        if cached is not None:
+            return cached
         _sizes, ks = self._kernels[source]
-        mat = np.zeros((len(ks), nfft), dtype=np.float64)
+        k_len = max(len(k) for k in ks)
+        mat = np.zeros((len(ks), k_len), dtype=np.float64)
         for i, k in enumerate(ks):
-            n = min(len(k), nfft)
-            mat[i, :n] = k[:n]
-        spec = _rfft(mat, nfft)
-        self._kfft[(source, 0)] = (nfft, spec)
-        return spec
+            mat[i, : len(k)] = k
+        self._kmat[source] = mat
+        return mat
+
+    # Grain lead-in so the zero-phase crossover's pre-ring isn't cut off
+    _FUSE_PAD = 256
+
+    def _band_matrices(self, source: str) -> Tuple[np.ndarray, np.ndarray]:
+        """The grains split at ``fuse_hz``: (high, low), power-complementary
+        (|H|² + |L|² = 1) over an octave, both delayed by _FUSE_PAD."""
+        source = self._alias.get(source, source)
+        key = (source, "bands", float(self.fuse_hz))
+        cached = self._kmat.get(key)
+        if cached is not None:
+            return cached
+        mat = self._kernel_matrix(source)
+        pad = self._FUSE_PAD
+        n = _fast_len(mat.shape[1] + 2 * pad)
+        x = np.zeros((mat.shape[0], n), dtype=np.float64)
+        x[:, pad: pad + mat.shape[1]] = mat
+        f = np.fft.rfftfreq(n, 1.0 / self.sr)
+        # 0 below fc/√2 → 1 above fc·√2, a quarter-sine in log frequency
+        t = np.clip((np.log2(np.maximum(f, 1e-9) / self.fuse_hz) + 0.5), 0.0, 1.0)
+        w_hi = np.sin(0.5 * math.pi * t)
+        w_lo = np.cos(0.5 * math.pi * t)
+        X = _rfft(x, n)
+        out = (_irfft(X * w_hi[None], n), _irfft(X * w_lo[None], n))
+        self._kmat[key] = out
+        return out
+
+    def _grain_matrix(self, source: str, g_lo: float) -> np.ndarray:
+        """Grains with their low band scaled by ``g_lo`` (1 = untouched)."""
+        if self.fuse_hz <= 0.0 or g_lo >= 0.999:
+            return self._kernel_matrix(source)
+        g_lo = round(float(g_lo), 2)
+        canon = self._alias.get(source, source)
+        key = (canon, "mix", float(self.fuse_hz), g_lo)
+        cached = self._kmat.get(key)
+        if cached is None:
+            hi, lo = self._band_matrices(canon)
+            cached = hi + g_lo * lo
+            stale = [k for k in self._kmat if isinstance(k, tuple) and k[0] == canon and k[1] == "mix"]
+            if len(stale) > 8:
+                for k in stale:
+                    del self._kmat[k]
+            self._kmat[key] = cached
+        return cached
+
+    def _bed_filter(self, source: str, dist: DropSizeDist, d_lo: float, d_hi: float, nfft: int,
+                    low_only: bool = False):
+        """Spectrum (at ``nfft``) and length of the roar's filter.
+
+        Infinitely dense shot noise is Gaussian with the grains' power
+        spectrum, Σ_rows w_r |K_r|², w_r the share of drop energy in that
+        size bin. One white noise through a filter with that magnitude is
+        the same random process as white noise in every kernel row — for
+        one FFT instead of one per row. ``low_only``: the grains' band
+        under ``fuse_hz`` (see _band_matrices).
+        """
+        canon = self._alias.get(source, source)
+        key = (canon, round(float(d_lo), 3), round(float(d_hi), 3),
+               float("%.4g" % dist.flux(d_lo, d_hi)), float("%.4g" % dist.energy()),
+               float(self.fuse_hz) if low_only else 0.0)
+        filt = self._bed_cache.get(key)
+        if filt is None:
+            sizes, ks = self._kernels[canon]
+            n_var = len(ks) // len(sizes)
+            probe = dist.sample(4096, np.random.RandomState(1), d_lo, d_hi)
+            e_a = impact_amp(probe) ** 2 * math.exp(2.0 * 0.45 ** 2)
+            bins = np.abs(np.log(probe)[:, None] - np.log(sizes)[None, :]).argmin(axis=1)
+            per_bin = np.bincount(bins, weights=e_a, minlength=len(sizes)) / len(probe)
+            # Only the size bins that carry the energy (≥1% of the top bin)
+            per_bin = np.where(per_bin >= 0.01 * per_bin.max(), per_bin, 0.0)
+            w = np.repeat(per_bin, n_var) / n_var
+            mat = self._band_matrices(canon)[1] if low_only else self._kernel_matrix(canon)
+            n_h = 2 * mat.shape[1]
+            power = (w[:, None] * np.abs(_rfft(mat, n_h)) ** 2).sum(axis=0)
+            # Zero-phase, centred, tapered so it doesn't wrap
+            h = np.roll(_irfft(np.sqrt(power), n_h), n_h // 2) * np.hanning(n_h)
+            e_want = float(np.sum(w * np.sum(mat * mat, axis=1)))
+            h *= math.sqrt(e_want / max(1e-30, float(np.sum(h * h))))
+            filt = {"h": h}
+            if len(self._bed_cache) > 64:
+                self._bed_cache.clear()
+            self._bed_cache[key] = filt
+        spec = filt.get(nfft)
+        if spec is None:
+            spec = filt[nfft] = _rfft(filt["h"], nfft)
+        return spec, len(filt["h"])
 
     def render(
         self,
@@ -186,13 +297,14 @@ class DenseRainTexture:
         amp_scale: float,
     ) -> Optional[np.ndarray]:
         sizes, ks = self._kernels[source]
-        k_len = max(len(k) for k in ks) if ks else 0
-        if k_len <= 0:
+        if not ks or rate <= 0.0 or amp_scale <= 0.0 or d_hi <= d_lo:
             return None
-        nfft = _fast_len(frames + k_len)
-        if rate <= 0.0 or amp_scale <= 0.0 or d_hi <= d_lo:
-            return None
-        spec_k = self._kernel_fft(source, nfft)
+        # Low band: grains keep √(1-β) of it, the roar carries β
+        beta = 0.0
+        if self.fuse_hz > 0.0 and self.fuse_full > self.fuse_from:
+            beta = min(1.0, max(0.0, (rate - self.fuse_from) / (self.fuse_full - self.fuse_from)))
+        kmat = self._grain_matrix(source, math.sqrt(1.0 - beta))
+        k_len = kmat.shape[1]
         log_sizes = np.log(sizes)
         lam = rate * frames / float(self.sr)
         # Grain cap per source per stem
@@ -205,11 +317,24 @@ class DenseRainTexture:
             bed = (1.0 - m) * (lam - cap) / float(frames)
             lam = cap
         rng = self.rng
-        stems = np.zeros((self.n_stems, frames), dtype=np.float64)
-        n_k = len(ks)
-        n_var = n_k // len(sizes)
-        # All stems' impulse trains at once: (stem, kernel, time)
-        imp = np.zeros((self.n_stems, n_k, frames), dtype=np.float64)
+        n_var = len(ks) // len(sizes)
+        n_out = frames + k_len
+        beds = []  # (spectrum, drops/sample)
+        n_fft = _fast_len(frames + 2 * k_len)
+        if bed > 0.0:
+            spec, n_h = self._bed_filter(source, dist, d_lo, d_hi, n_fft)
+            beds.append((spec, bed))
+            n_out = max(n_out, frames + n_h)
+        if beta > 0.0:
+            spec, n_h = self._bed_filter(source, dist, d_lo, d_hi, n_fft, low_only=True)
+            beds.append((spec, beta * rate / float(self.sr)))
+            n_out = max(n_out, frames + n_h)
+        # A longer tail from last block (roar on, now off) must not be cut
+        for st in range(self.n_stems):
+            tail = self._tails.get((source, st))
+            if tail is not None:
+                n_out = max(n_out, len(tail))
+        ys = np.zeros((self.n_stems, n_out), dtype=np.float64)
         for s in range(self.n_stems):
             n = int(rng.poisson(lam))
             if n > 0:
@@ -219,34 +344,26 @@ class DenseRainTexture:
                 ki = np.abs(np.log(d)[:, None] - log_sizes[None, :]).argmin(axis=1)
                 ki = ki * n_var + rng.randint(0, n_var, n)
                 pos = rng.randint(0, frames, n)
-                np.add.at(imp[s], (ki, pos), a)
-        if bed > 0.0:
-            # Infinitely dense shot noise is Gaussian with the grains' spectrum:
-            # white noise in every kernel row, scaled to that size bin's energy.
-            probe = dist.sample(512, rng, d_lo, d_hi)
-            e_a = (impact_amp(probe) * amp_scale) ** 2 * math.exp(2.0 * 0.45 ** 2)
-            bins = np.abs(np.log(probe)[:, None] - log_sizes[None, :]).argmin(axis=1)
-            per_bin = np.bincount(bins, weights=e_a, minlength=len(sizes)) / len(probe)
-            sd = np.sqrt(bed * np.repeat(per_bin, n_var) / n_var)
-            # Only the size bins that carry the energy (≥1% of the top bin)
-            rows = np.flatnonzero(np.repeat(per_bin >= 0.01 * per_bin.max(), n_var))
-            noise = self._bed_rng.standard_normal((self.n_stems, len(rows), frames), dtype=np.float32)
-            imp[:, rows] += noise * sd[rows][None, :, None]
-        used = np.flatnonzero(imp.any(axis=(0, 2)))
-        ys = None
-        if len(used):
-            ys = _irfft((_rfft(imp[:, used], nfft) * spec_k[used][None]).sum(axis=1), nfft)
+                # A few dozen grains a block: overlap-add them directly
+                # (cheaper than an FFT per kernel row)
+                row = ys[s]
+                for p_, k_, a_ in zip(pos.tolist(), ki.tolist(), a.tolist()):
+                    row[p_: p_ + k_len] += a_ * kmat[k_]
+        for spec, rate_s in beds:
+            noise = self._bed_rng.standard_normal((self.n_stems, frames))
+            roar = _irfft(_rfft(noise, n_fft) * spec[None], n_fft)
+            m = min(n_out, n_fft)
+            ys[:, :m] += roar[:, :m] * (math.sqrt(rate_s) * amp_scale)
+        stems = np.zeros((self.n_stems, frames), dtype=np.float64)
         for s in range(self.n_stems):
             key = (source, s)
+            y = ys[s]
             tail = self._tails.get(key)
-            if ys is None and tail is None:
-                continue
-            y = ys[s] if ys is not None else np.zeros(nfft, dtype=np.float64)
             if tail is not None:
-                m = min(len(tail), nfft)
+                m = min(len(tail), n_out)
                 y[:m] += tail[:m]
             stems[s] = y[:frames]
-            rest = y[frames : frames + k_len]
+            rest = y[frames:]
             if float(np.max(np.abs(rest))) > 1e-9:
                 self._tails[key] = rest
             elif key in self._tails:

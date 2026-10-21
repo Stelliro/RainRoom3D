@@ -1,34 +1,34 @@
-from PySide6 import QtCore, QtGui, QtWidgets
+"""Reusable widgets: compass wheels, collapsible sections, preset chips."""
+
+from __future__ import annotations
+
 import math
 
+from PySide6 import QtCore, QtGui, QtWidgets
 
-class WindDirectionWheel(QtWidgets.QWidget):
-    """Compass wheel with an arrow showing where wind (rain) is blown toward.
+from app.ui.theme import C, T, qcolor
 
-    Degrees: 0°=North (up), 90°=East (right), 180°=South, 270°=West.
-    """
+
+class CompassWheel(QtWidgets.QWidget):
+    """Drag-to-set compass. 0° = North (up), 90° = East (right), clockwise."""
 
     valueChanged = QtCore.Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, size: int = 120, color: str = T.accent, show_degrees: bool = True):
         super().__init__(parent)
-        self._deg = 90  # default east
+        self._deg = 90
         self._dragging = False
-        self.setFixedSize(132, 132)
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Fixed,
-            QtWidgets.QSizePolicy.Fixed,
-        )
-        self.setToolTip(
-            "Drag to set wind direction. Arrow points where rain is blown toward.\n"
-            "0°=North, 90°=East, 180°=South, 270°=West."
-        )
+        self._color = color
+        self._show_deg = show_degrees
+        self.setFixedSize(size, size)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
 
     def value(self) -> int:
         return int(self._deg) % 360
 
-    def setValue(self, deg: int):
+    def setValue(self, deg: int):  # noqa: N802 (Qt-style API)
         d = int(deg) % 360
         if d != self._deg:
             self._deg = d
@@ -36,23 +36,16 @@ class WindDirectionWheel(QtWidgets.QWidget):
             self.valueChanged.emit(self._deg)
 
     def sizeHint(self):
-        return QtCore.QSize(140, 140)
+        return self.size()
 
     def _center_radius(self):
         side = min(self.width(), self.height())
-        r = side * 0.42
-        c = QtCore.QPointF(self.width() * 0.5, self.height() * 0.5)
-        return c, r
+        return QtCore.QPointF(self.width() * 0.5, self.height() * 0.5), side * 0.44
 
     def _deg_from_pos(self, pos: QtCore.QPointF) -> int:
         c, _ = self._center_radius()
-        dx = pos.x() - c.x()
-        dy = pos.y() - c.y()
-        # Screen: +x right, +y down. Compass: 0=up(N), clockwise.
-        ang = math.degrees(math.atan2(dx, -dy))  # 0 up, + toward east
-        if ang < 0:
-            ang += 360.0
-        return int(round(ang)) % 360
+        ang = math.degrees(math.atan2(pos.x() - c.x(), -(pos.y() - c.y())))
+        return int(round(ang + 360.0)) % 360
 
     def mousePressEvent(self, e: QtGui.QMouseEvent):
         if e.button() == QtCore.Qt.LeftButton:
@@ -70,175 +63,227 @@ class WindDirectionWheel(QtWidgets.QWidget):
             self._dragging = False
             e.accept()
 
-    def paintEvent(self, e: QtGui.QPaintEvent):
+    def keyPressEvent(self, e: QtGui.QKeyEvent):
+        step = 15 if e.modifiers() & QtCore.Qt.ShiftModifier else 1
+        if e.key() in (QtCore.Qt.Key_Right, QtCore.Qt.Key_Up):
+            self.setValue(self._deg + step)
+        elif e.key() in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Down):
+            self.setValue(self._deg - step)
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, _e):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         c, r = self._center_radius()
+        en = self.isEnabled()
+        accent = qcolor(self._color if en else T.disabled)
 
-        # Disc
-        p.setPen(QtGui.QPen(QtGui.QColor("#3d4a5c"), 2))
-        p.setBrush(QtGui.QColor("#1a2230"))
+        p.setPen(QtGui.QPen(qcolor(C.wheel_ring), 1.5))
+        p.setBrush(qcolor(C.wheel_disc))
         p.drawEllipse(c, r, r)
+        if self.hasFocus():
+            p.setPen(QtGui.QPen(qcolor(T.accent_line), 1.5))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawEllipse(c, r + 1.5, r + 1.5)
 
-        # Inner ring
-        p.setPen(QtGui.QPen(QtGui.QColor("#2a3545"), 1))
-        p.setBrush(QtCore.Qt.NoBrush)
-        p.drawEllipse(c, r * 0.72, r * 0.72)
+        for i in range(24):
+            a = math.radians(i * 15.0)
+            major = i % 6 == 0
+            r0 = r * (0.80 if major else 0.87)
+            p.setPen(QtGui.QPen(qcolor(C.wheel_tick_major if major else C.wheel_tick), 1.6 if major else 1))
+            p.drawLine(QtCore.QPointF(c.x() + r0 * math.sin(a), c.y() - r0 * math.cos(a)),
+                       QtCore.QPointF(c.x() + r * 0.94 * math.sin(a), c.y() - r * 0.94 * math.cos(a)))
 
-        # Tick marks every 30°
-        for i in range(12):
-            a = math.radians(i * 30.0)
-            # 0° up
-            outer = QtCore.QPointF(
-                c.x() + r * 0.92 * math.sin(a),
-                c.y() - r * 0.92 * math.cos(a),
-            )
-            inner = QtCore.QPointF(
-                c.x() + r * (0.78 if i % 3 == 0 else 0.84) * math.sin(a),
-                c.y() - r * (0.78 if i % 3 == 0 else 0.84) * math.cos(a),
-            )
-            p.setPen(QtGui.QPen(QtGui.QColor("#6b7c93" if i % 3 == 0 else "#3d4a5c"), 2 if i % 3 == 0 else 1))
-            p.drawLine(inner, outer)
-
-        # Cardinal labels
         font = p.font()
         font.setBold(True)
-        font.setPointSize(max(8, int(r * 0.14)))
+        font.setPixelSize(max(9, int(r * 0.2)))
         p.setFont(font)
-        p.setPen(QtGui.QColor("#94a3b8"))
-        for label, ang in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
+        fm = p.fontMetrics()
+        for lab, ang in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
             a = math.radians(float(ang))
-            lp = QtCore.QPointF(
-                c.x() + r * 0.58 * math.sin(a) - 5,
-                c.y() - r * 0.58 * math.cos(a) + 5,
-            )
-            p.drawText(lp, label)
+            p.setPen(qcolor(T.text if lab == "N" else C.wheel_label))
+            x = c.x() + r * 0.6 * math.sin(a) - fm.horizontalAdvance(lab) / 2
+            y = c.y() - r * 0.6 * math.cos(a) + fm.ascent() / 2 - 1
+            p.drawText(QtCore.QPointF(x, y), lab)
 
-        # Arrow: points where wind blows rain toward
         a = math.radians(float(self._deg % 360))
-        # Unit vector in compass frame (0=up)
-        ux = math.sin(a)
-        uy = -math.cos(a)
-        # Perpendicular for arrow head
+        ux, uy = math.sin(a), -math.cos(a)
         px, py = -uy, ux
-
-        tip = QtCore.QPointF(c.x() + ux * r * 0.78, c.y() + uy * r * 0.78)
-        tail = QtCore.QPointF(c.x() - ux * r * 0.28, c.y() - uy * r * 0.28)
-        # Shaft
-        p.setPen(QtGui.QPen(QtGui.QColor("#38bdf8"), 3.5, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
-        p.drawLine(tail, tip)
-        # Arrow head
-        head_len = r * 0.28
-        head_w = r * 0.16
-        base = QtCore.QPointF(tip.x() - ux * head_len, tip.y() - uy * head_len)
-        left = QtCore.QPointF(base.x() + px * head_w, base.y() + py * head_w)
-        right = QtCore.QPointF(base.x() - px * head_w, base.y() - py * head_w)
-        head = QtGui.QPolygonF([tip, left, right])
+        tip = QtCore.QPointF(c.x() + ux * r * 0.80, c.y() + uy * r * 0.80)
+        tail = QtCore.QPointF(c.x() - ux * r * 0.30, c.y() - uy * r * 0.30)
+        p.setPen(QtGui.QPen(accent, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        hl, hw = r * 0.26, r * 0.15
+        base = QtCore.QPointF(tip.x() - ux * hl, tip.y() - uy * hl)
+        p.drawLine(tail, base)
         p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor("#38bdf8"))
-        p.drawPolygon(head)
-        # Small hub
-        p.setBrush(QtGui.QColor("#e2e8f0"))
+        p.setBrush(accent)
+        p.drawPolygon(QtGui.QPolygonF([tip, QtCore.QPointF(base.x() + px * hw, base.y() + py * hw),
+                                       QtCore.QPointF(base.x() - px * hw, base.y() - py * hw)]))
+        p.setBrush(qcolor(T.text))
         p.drawEllipse(c, r * 0.07, r * 0.07)
 
-        # Degree text under hub
-        font.setPointSize(max(7, int(r * 0.12)))
-        font.setBold(False)
-        p.setFont(font)
-        p.setPen(QtGui.QColor("#cbd5e1"))
-        txt = f"{self._deg}°"
-        br = p.fontMetrics().boundingRect(txt)
-        p.drawText(
-            QtCore.QPointF(c.x() - br.width() * 0.5, c.y() + r * 0.95),
-            txt,
+        if self._show_deg:
+            font.setBold(False)
+            font.setPixelSize(max(9, int(r * 0.17)))
+            p.setFont(font)
+            p.setPen(qcolor(T.text2))
+            txt = f"{self._deg}°"
+            br = p.fontMetrics().horizontalAdvance(txt)
+            p.drawText(QtCore.QPointF(c.x() - br * 0.5, c.y() + r * 0.42), txt)
+
+
+class WindDirectionWheel(CompassWheel):
+    """Arrow shows where the wind blows the rain toward."""
+
+    def __init__(self, parent=None, size: int = 120):
+        super().__init__(parent, size=size, color=T.accent, show_degrees=False)
+        self.setToolTip(
+            "Drag to set the wind direction. The arrow points where the rain is blown.\n"
+            "0° = North, 90° = East, 180° = South, 270° = West."
         )
 
 
-class Knob(QtWidgets.QDial):
-    def __init__(self, *a, **k):
-        super().__init__(*a, **k)
-        self.setNotchesVisible(True)
+class CollapsibleSection(QtWidgets.QWidget):
+    """A header you click to fold its body away — keeps long panels short
+    while every control stays one click from view."""
 
-class Meter(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
-        self.v = 0.0
-    def set_value(self, v):
-        self.v = max(0.0, min(1.0, v))
-        self.update()
-    def paintEvent(self, e):
-        p = QtGui.QPainter(self)
-        r = self.rect()
-        p.fillRect(r, QtGui.QColor('#111'))
-        h = int(r.height()*self.v)
-        p.fillRect(QtCore.QRect(r.left(), r.bottom()-h, r.width(), h), QtGui.QColor('#3aa'))
+    toggled = QtCore.Signal(bool)
 
-class RoomCanvas(QtWidgets.QWidget):
-    yawChanged = QtCore.Signal(float)
-    def __init__(self):
-        super().__init__()
-        self.setMouseTracking(True)
-        self.setMinimumSize(480, 360)
-        self.room = None
-        self.dragging = False
-        self.last_pos = None
-    def set_room(self, room):
-        self.room = room
-        self.update()
-    def _project(self, x, z):
-        if not self.room: return 0,0
-        margin = 40
-        W = self.width() - 2*margin
-        H = self.height() - 2*margin
-        sx = W / max(1e-3, self.room.width)
-        sz = H / max(1e-3, self.room.depth)
-        px = margin + x*sx
-        pz = margin + z*sz
-        return int(px), int(pz)
-    def mousePressEvent(self, e):
-        if e.button() == QtCore.Qt.LeftButton:
-            self.dragging = True
-            self.last_pos = e.position()
-    def mouseMoveEvent(self, e):
-        if self.dragging and self.room:
-            dx = e.position().x() - self.last_pos.x()
-            yaw_delta = dx * 0.01
-            self.room.listener.yaw += yaw_delta
-            self.last_pos = e.position()
-            self.yawChanged.emit(self.room.listener.yaw)
-            self.update()
-    def mouseReleaseEvent(self, e):
-        self.dragging = False
-    def paintEvent(self, e):
-        p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing)
-        r = self.rect()
-        p.fillRect(r, QtGui.QColor('#0b0e11'))
-        if not self.room: return
-        p.setPen(QtGui.QPen(QtGui.QColor('#444'), 2))
-        margin = 40
-        p.drawRect(margin, margin, self.width()-2*margin, self.height()-2*margin)
-        # windows
-        p.setPen(QtGui.QPen(QtGui.QColor('#2aa198'), 3))
-        for w in self.room.windows:
-            x1,z1 = self._project(w.x, w.z)
-            x2,_ = self._project(min(self.room.width, w.x+w.width), w.z)
-            p.drawLine(x1,z1, x2,z1)
-            p.setBrush(QtGui.QColor(42,161,152, int(80*max(0.0,min(1.0,w.open)))))
-            p.drawEllipse(QtCore.QPointF((x1+x2)/2, z1), 6+8*w.open, 6+8*w.open)
-        # speakers
-        p.setPen(QtGui.QPen(QtGui.QColor('#b58900'), 2))
-        p.setBrush(QtGui.QColor('#b58900'))
-        for s in self.room.speakers:
-            x,z = self._project(s.x, s.z)
-            p.drawEllipse(QtCore.QPoint(x, z), 6, 6)
-        # listener
-        L = self.room.listener
-        lx,lz = self._project(L.x, L.z)
-        p.setBrush(QtGui.QColor('#268bd2'))
-        p.setPen(QtGui.QPen(QtGui.QColor('#268bd2'), 2))
-        p.drawEllipse(QtCore.QPoint(lx, lz), 7, 7)
-        rlen = 24
-        x2 = lx + rlen*math.sin(L.yaw)
-        z2 = lz + rlen*math.cos(L.yaw)
-        p.drawLine(lx,lz, int(x2), int(z2))
+    def __init__(self, title: str, subtitle: str = "", expanded: bool = True,
+                 nested: bool = False, parent=None):
+        super().__init__(parent)
+        from app.ui.studio.icons import icon
+
+        self._nested = nested
+        self._icons = (icon("chevron_right", T.text3, 14), icon("chevron_down", T.text2, 14))
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.header = QtWidgets.QToolButton()
+        self.header.setObjectName("SubSectionHeader" if nested else "SectionHeader")
+        self.header.setText(title if nested else title.upper())
+        self.header.setCheckable(True)
+        self.header.setChecked(bool(expanded))
+        self.header.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.header.setIconSize(QtCore.QSize(14, 14))
+        self.header.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.header.setCursor(QtCore.Qt.PointingHandCursor)
+        self.header.setFocusPolicy(QtCore.Qt.NoFocus)
+        lay.addWidget(self.header)
+        self.subtitle = QtWidgets.QLabel(subtitle)
+        self.subtitle.setObjectName("Hint")
+        self.subtitle.setWordWrap(True)
+        self.subtitle.setVisible(bool(subtitle))
+        lay.addWidget(self.subtitle)
+        self.body = QtWidgets.QWidget()
+        self.body_layout = QtWidgets.QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(4 if nested else 0, 6, 0, 4)
+        self.body_layout.setSpacing(14)
+        lay.addWidget(self.body)
+        self.header.toggled.connect(self.set_expanded)
+        self.set_expanded(bool(expanded))
+
+    def set_expanded(self, on: bool) -> None:
+        on = bool(on)
+        if self.header.isChecked() != on:
+            self.header.setChecked(on)  # re-enters via toggled
+            return
+        self.header.setIcon(self._icons[1] if on else self._icons[0])
+        self.body.setVisible(on)
+        if not self._nested:
+            self.subtitle.setVisible(on and bool(self.subtitle.text()))
+        self.toggled.emit(on)
+
+    def is_expanded(self) -> bool:
+        return self.header.isChecked()
+
+    def add_widget(self, w: QtWidgets.QWidget) -> None:
+        self.body_layout.addWidget(w)
+
+    def add_layout(self, layout: QtWidgets.QLayout) -> None:
+        self.body_layout.addLayout(layout)
+
+
+class PresetChips(QtWidgets.QWidget):
+    """One-click preset chips. A trailing "Custom" chip lights up when the
+    current values match no preset, so you always know where you stand."""
+
+    chosen = QtCore.Signal(str)
+
+    CUSTOM = "Custom"
+
+    def __init__(self, columns: int = 3, parent=None):
+        super().__init__(parent)
+        from app.ui.studio.controls import FlowLayout
+
+        self._columns = max(1, int(columns))  # kept for API compatibility (layout wraps)
+        self._flow = FlowLayout(self, spacing=6)
+        self._buttons = {}
+        self._current = None
+        self._custom = None
+
+    def set_presets(self, items) -> None:
+        """items: iterable of (name, tooltip) or (name, tooltip, chip text)."""
+        while self._flow.count():
+            it = self._flow.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        self._buttons = {}
+        for item in items:
+            name, tip = item[0], item[1]
+            b = self._chip(item[2] if len(item) > 2 else name, tip)
+            b.clicked.connect(lambda _=False, n=name: self._on_click(n))
+            self._buttons[name] = b
+            self._flow.addWidget(b)
+        self._custom = self._chip(self.CUSTOM, "Your own values — they match none of the presets.")
+        self._custom.setProperty("custom", True)
+        # Custom is a status, not a choice: clicking it just restores the highlight.
+        self._custom.clicked.connect(lambda _=False: self.set_current(self._current))
+        self._flow.addWidget(self._custom)
+        self.set_current(self._current if self._current in self._buttons else None)
+        self.updateGeometry()
+
+    def _chip(self, text: str, tip: str) -> QtWidgets.QPushButton:
+        b = QtWidgets.QPushButton(text, self)
+        b.setObjectName("Chip")
+        b.setCheckable(True)
+        b.setToolTip(tip or text)
+        b.setCursor(QtCore.Qt.PointingHandCursor)
+        b.setFocusPolicy(QtCore.Qt.TabFocus)
+        return b
+
+    def _on_click(self, name: str) -> None:
+        self.chosen.emit(name)
+        self.set_current(self._current)  # owner normally calls set_current; keep chips sane
+
+    def set_current(self, name) -> None:
+        self._current = name if name in self._buttons else None
+        for n, b in self._buttons.items():
+            b.setChecked(n == self._current)
+        if self._custom is not None:
+            self._custom.setChecked(self._current is None)
+
+    def current(self):
+        return self._current
+
+    def buttons(self):
+        return dict(self._buttons)
+
+    def hasHeightForWidth(self):  # noqa: N802
+        return True
+
+    def heightForWidth(self, w):  # noqa: N802
+        return self._flow.heightForWidth(w)
+
+    def sizeHint(self):
+        w = max(200, self.width())
+        return QtCore.QSize(w, self._flow.heightForWidth(w))
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(120, self._flow.heightForWidth(max(120, self.width())))
+
+
+__all__ = ["CollapsibleSection", "CompassWheel", "PresetChips", "WindDirectionWheel"]

@@ -268,6 +268,10 @@ class Room:
     terrain_size: float = 40.0
     roof_material: str = "Metal Roof"
     wall_material: str = "Brick Wall"
+    # Wall thickness in m; 0 = the usual build of the wall material
+    # (house_model.TYPICAL_THICKNESS_M). Thicker blocks more, deeper reveals.
+    wall_thickness: float = 0.0
+    roof_thickness: float = 0.0  # m; 0 = the usual build of the roof material
     windows: List[Window] = field(default_factory=list)
     speakers: List[Speaker] = field(default_factory=list)
     headphones_items: List[Headphones] = field(default_factory=list)
@@ -309,6 +313,12 @@ class Room:
     wind_speed_range: float = 0.25       # ± of base speed (0..1 units)
     wind_speed_interval_s: float = 8.0   # how often a new speed target is chosen
     wind_speed_slew_per_s: float = 0.20  # max speed change rate (units/s)
+
+    # --- Thunder (a storm around the house; thunder.py) ---
+    # ``thunder`` above is an old unused field, kept so old files load as before.
+    thunder_rate: float = 0.0            # how often: 0 none .. 1 every few seconds
+    thunder_distance: float = 0.45       # 0 overhead .. 1 far away (≈2 km at 0.5)
+    mix_thunder: float = 1.0             # Sound mix: thunder level
 
     # ------------------------------------------------------------------
     # Wind helpers

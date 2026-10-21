@@ -208,6 +208,7 @@ def window_acoustic_profile(
     height: float = 1.2,
     angle_deg: float = 45.0,
     hinge_side: str = "left",
+    leak_k: float = 1.0,
 ) -> dict:
     """Style + geometry dependent portal acoustics.
 
@@ -223,7 +224,8 @@ def window_acoustic_profile(
     """
     o = max(0.0, min(1.0, float(open_amt)))
     style = (style or "casement").lower().replace("-", "_")
-    leak = 0.025
+    # Through the closed pane; leak_k = heavier glazing (house_model.glazing_k)
+    leak = 0.025 * max(0.0, float(leak_k))
     area = max(0.05, float(width) * float(height))
     area_k = math.sqrt(area / 1.2)  # soft area law
 
@@ -356,6 +358,10 @@ def couple_outdoor_to_windows(
         return hits
 
     sx, sy, sz = src
+    from app.audio import house_model as hm
+
+    wall_depth = hm.wall_thickness(room)
+    glaze_k = hm.glazing_k(room)
 
     for w in windows:
         wall = str(getattr(w, "wall", "north") or "north")
@@ -403,6 +409,7 @@ def couple_outdoor_to_windows(
             height=float(getattr(w, "height", 1.2)),
             angle_deg=angle,
             hinge_side=hinge,
+            leak_k=glaze_k,
         )
 
         # --- Vertical geometry: does the outdoor drop align with the gap? ---
@@ -447,7 +454,14 @@ def couple_outdoor_to_windows(
             att_out = distance_attenuation(d_out, ref=1.0, rolloff=1.1)
         depth_g = 1.0 / (1.0 + 0.08 * max(0.0, d_out - 1.0))
 
-        gain = 2.6 * prof["gain"] * att_out * axis * lat_g * vert_g * depth_g
+        # A window sits in the wall: its reveal hides it from steep angles
+        reveal = 1.0
+        if not wrapped and not getattr(w, "free_place", False):
+            along = max(1e-3, _dot(to_src, nrm))
+            reveal = math.sqrt(hm.reveal_fraction(
+                wall_depth, float(getattr(w, "width", 1.0)), float(getattr(w, "height", 1.2)),
+                lat / along, (sy - ap[1]) / along))
+        gain = 2.6 * prof["gain"] * att_out * axis * lat_g * vert_g * depth_g * reveal
         if gain < 1e-5:
             continue
 
@@ -606,7 +620,7 @@ def _wall_body(
     if hit is None:
         return None
     wall, dist, u, win = hit
-    mat = hm.material("glass") if win is not None else hm.wall_material(room)
+    mat = hm.glass_material(room) if win is not None else hm.wall_material(room)
     if dist <= WALL_CONTACT_M:
         g = mat.impact
     else:
@@ -938,7 +952,8 @@ def azimuth_elevation(from_pos: Vec3, to_pos: Vec3, yaw: float = 0.0) -> Tuple[f
     dx = to_pos[0] - from_pos[0]
     dy = to_pos[1] - from_pos[1]
     dz = to_pos[2] - from_pos[2]
-    c, s = math.cos(-yaw), math.sin(-yaw)
+    # Facing (sin yaw, cos yaw) in x/z; az > 0 = to the right (= atan2(dx, dz) - yaw)
+    c, s = math.cos(yaw), math.sin(yaw)
     rx = c * dx - s * dz
     rz = s * dx + c * dz
     az = math.atan2(rx, rz)

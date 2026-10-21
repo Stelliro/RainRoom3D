@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#10141b" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no">
+<title>RainRoom</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app" class="app" data-tab="listen" data-live="0" aria-busy="true">
+
+  <!-- ===== Top bar ===== -->
+  <header class="topbar">
+    <button class="room-title" id="roomTitle" type="button" aria-label="Rename this room">
+      <span class="conn-dot" id="connDot" aria-hidden="true"></span>
+      <span class="room-title__text">
+        <span class="room-title__name" id="roomName">Your room</span>
+        <span class="room-title__sub" id="roomSub">Connecting…</span>
+      </span>
+      <span class="ico ico--sm room-title__pen" data-icon="pencil" aria-hidden="true"></span>
+    </button>
+    <button class="pill" id="weatherPill" type="button" aria-label="Shared weather, open the weather tab">
+      <span class="ico ico--sm" data-icon="cloud_rain" aria-hidden="true"></span>
+      <span class="pill__text"><span class="pill__k">Shared weather</span><span class="pill__v" id="pillText">…</span></span>
+    </button>
+  </header>
+
+  <div class="banner" id="offlineBanner" role="status" aria-live="polite" hidden>
+    <span class="spinner" aria-hidden="true"></span>
+    <span id="offlineText">Reconnecting to the computer…</span>
+  </div>
+
+  <!-- ===== Tabs ===== -->
+  <main class="panels">
+
+    <!-- LISTEN -->
+    <section class="panel" id="panel-listen" role="tabpanel" aria-labelledby="tab-listen">
+      <div class="panel__inner">
+
+        <div class="card hero" id="hero">
+          <div class="hero__stage">
+            <canvas class="hero__ring" id="levelRing" aria-hidden="true"></canvas>
+            <button class="big-btn" id="playBtn" type="button" aria-describedby="playState" aria-disabled="true">
+              <span class="ico ico--xl" data-icon="play" id="playIcon" aria-hidden="true"></span>
+              <span class="sr-only" id="playLabel">Start listening</span>
+            </button>
+          </div>
+          <div class="hero__state" id="playState" role="status" aria-live="polite">
+            <span class="hero__state-main" id="stateMain">Stopped</span>
+            <span class="hero__state-sub" id="stateSub">Tap to hear the rain in this room</span>
+          </div>
+          <div class="meter" id="meter" aria-hidden="true">
+            <div class="meter__bar"><div class="meter__fill" id="meterFill"></div></div>
+            <span class="meter__val" id="meterVal">—</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="field-head">
+            <span class="label" id="playOnLabel">Play on</span>
+          </div>
+          <div class="seg" role="radiogroup" aria-labelledby="playOnLabel" id="targetSeg">
+            <button type="button" role="radio" class="seg__btn" data-target="phone" aria-checked="true">
+              <span class="ico ico--sm" data-icon="phone" aria-hidden="true"></span>This phone</button>
+            <button type="button" role="radio" class="seg__btn" data-target="pc" aria-checked="false">
+              <span class="ico ico--sm" data-icon="speaker" aria-hidden="true"></span>A PC speaker</button>
+          </div>
+          <div class="devices" id="devicesBox" hidden>
+            <div class="devices__head">
+              <span class="caption">Sound outputs on <span id="pcName">the computer</span></span>
+              <button class="icon-btn" id="refreshDevices" type="button" aria-label="Look for sound outputs again">
+                <span class="ico ico--sm" data-icon="refresh" aria-hidden="true"></span>
+              </button>
+            </div>
+            <div class="radio-list" role="radiogroup" aria-label="Computer sound output" id="deviceList"></div>
+          </div>
+          <p class="note" id="targetNote">The computer works out how the rain sounds in this room and sends it to this phone. Headphones sound best.</p>
+        </div>
+
+        <div class="card">
+          <div class="slider-row" id="volumeRow"></div>
+        </div>
+
+        <div class="card">
+          <div class="field-head">
+            <span class="label">Weather</span>
+            <span class="tag"><span class="ico ico--xs" data-icon="house" aria-hidden="true"></span>Shared</span>
+          </div>
+          <div class="chips" id="quickPresets" role="radiogroup" aria-label="Weather presets"><div class="loading"><span class="spinner" aria-hidden="true"></span>Getting the weather from the computer…</div></div>
+          <div class="slider-row" id="quickAmount"></div>
+        </div>
+
+        <p class="note note--center" id="listenNote">
+          You hear the rain through this room's windows, from your listening spot.
+          Change them on the <button type="button" class="link" data-goto="room">Room</button> tab.
+        </p>
+        <p class="note note--center note--muted" id="lockNote" hidden></p>
+      </div>
+    </section>
+
+    <!-- ROOM -->
+    <section class="panel panel--room" id="panel-room" role="tabpanel" aria-labelledby="tab-room" hidden>
+      <div class="panel__inner panel__inner--room">
+        <div class="plan-toolbar" role="toolbar" aria-label="Room tools">
+          <button class="btn btn--accent" id="addWindowBtn" type="button">
+            <span class="ico ico--sm" data-icon="plus" aria-hidden="true"></span>Window</button>
+          <button class="btn" id="facingBtn" type="button" aria-label="Listening spot and facing">
+            <span class="ico ico--sm" data-icon="you" aria-hidden="true"></span><span id="facingText">Facing N</span></button>
+          <button class="btn" id="roomBtn" type="button">
+            <span class="ico ico--sm" data-icon="sliders" aria-hidden="true"></span>Room</button>
+        </div>
+        <div class="plan-wrap" id="planWrap">
+          <canvas id="plan" class="plan" tabindex="0" role="img"
+                  aria-label="Floor plan of your room. Use the window list below, or the Room and Facing buttons, to edit without the plan."></canvas>
+          <div class="plan-hint" id="planHint" aria-live="polite"></div>
+          <div class="place-bar" id="placeBar" hidden>
+            <span>Tap a wall to put the window there</span>
+            <button class="btn btn--sm" type="button" id="placeCancel">Cancel</button>
+          </div>
+        </div>
+        <div class="room-below">
+          <button class="card room-summary" id="roomSummary" type="button" aria-label="Room size and materials">
+            <span class="ico" data-icon="house" aria-hidden="true"></span>
+            <span class="room-summary__text">
+              <span class="room-summary__main" id="sumMain">Loading your room…</span>
+              <span class="room-summary__sub" id="sumSub">Waiting for the computer</span>
+            </span>
+            <span class="ico ico--sm" data-icon="chevron_right" aria-hidden="true"></span>
+          </button>
+          <div class="list" id="windowList" role="list" aria-label="Windows"></div>
+          <p class="note note--center">This room is only for this phone. The computer's own house stays as it is.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- WEATHER -->
+    <section class="panel" id="panel-weather" role="tabpanel" aria-labelledby="tab-weather" hidden>
+      <div class="panel__inner">
+        <div class="shared-note" role="note">
+          <span class="ico" data-icon="house" aria-hidden="true"></span>
+          <span>Shared with everyone in the house. Changes here change the PC too.</span>
+        </div>
+        <div class="card">
+          <div class="field-head"><span class="label">Presets</span><span class="caption" id="presetNow"></span></div>
+          <div class="chips" id="presetChips" role="radiogroup" aria-label="Weather presets"><div class="loading"><span class="spinner" aria-hidden="true"></span>Getting the presets…</div></div>
+          <p class="note" id="presetDesc"></p>
+        </div>
+        <div class="card" id="rainCard">
+          <div class="card__title"><span class="ico ico--sm" data-icon="droplet" aria-hidden="true"></span>Rain</div>
+          <div id="rainControls"><div class="loading"><span class="spinner" aria-hidden="true"></span>Getting the rain settings…</div></div>
+        </div>
+        <div class="card" id="windCard">
+          <div class="card__title"><span class="ico ico--sm" data-icon="wind" aria-hidden="true"></span>Wind</div>
+          <div id="windControls"><div class="loading"><span class="spinner" aria-hidden="true"></span>Getting the wind settings…</div></div>
+          <button class="disclosure" type="button" id="moreBtn" aria-expanded="false" aria-controls="moreControls" hidden>
+            <span>More wind settings</span><span class="ico ico--sm" data-icon="chevron_down" aria-hidden="true"></span>
+          </button>
+          <div id="moreControls" hidden></div>
+        </div>
+        <div class="card" id="thunderCard">
+          <div class="card__title"><span class="ico ico--sm" data-icon="bolt" aria-hidden="true"></span>Thunder</div>
+          <div id="thunderControls"><div class="loading"><span class="spinner" aria-hidden="true"></span>Getting the thunder settings…</div></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===== Tab bar ===== -->
+  <nav class="tabbar" role="tablist" aria-label="Sections">
+    <button class="tab" role="tab" id="tab-listen" data-tab="listen" aria-controls="panel-listen" aria-selected="true">
+      <span class="ico" data-icon="headphones" aria-hidden="true"></span><span>Listen</span></button>
+    <button class="tab" role="tab" id="tab-room" data-tab="room" aria-controls="panel-room" aria-selected="false" tabindex="-1">
+      <span class="ico" data-icon="plan" aria-hidden="true"></span><span>Room</span></button>
+    <button class="tab" role="tab" id="tab-weather" data-tab="weather" aria-controls="panel-weather" aria-selected="false" tabindex="-1">
+      <span class="ico" data-icon="cloud_rain" aria-hidden="true"></span><span>Weather</span></button>
+  </nav>
+
+  <!-- ===== Bottom sheets ===== -->
+  <div class="scrim" id="scrim" hidden></div>
+  <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" tabindex="-1" hidden>
+    <div class="sheet__grab" id="sheetGrab" aria-hidden="true"><span></span></div>
+    <div class="sheet__head" id="sheetHead">
+      <h2 class="sheet__title" id="sheetTitle">Sheet</h2>
+      <button class="icon-btn" type="button" id="sheetClose" aria-label="Close">
+        <span class="ico ico--sm" data-icon="close" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div class="sheet__body" id="sheetBody"></div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</div>
+
+<!-- ===== Full-screen notices ===== -->
+<div class="gate" id="gate" hidden>
+  <div class="gate__card">
+    <div class="gate__icon" id="gateIcon"><span class="ico ico--xl" data-icon="link" aria-hidden="true"></span></div>
+    <h1 class="gate__title" id="gateTitle">Open the link from the PC</h1>
+    <p class="gate__text" id="gateText"></p>
+    <button class="btn btn--accent btn--lg" type="button" id="gateBtn" hidden>Try again</button>
+  </div>
+</div>
+
+<noscript><div class="gate"><div class="gate__card"><h1 class="gate__title">RainRoom needs JavaScript</h1>
+<p class="gate__text">Turn on JavaScript for this page, then reload it.</p></div></div></noscript>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

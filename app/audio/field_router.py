@@ -127,6 +127,9 @@ class OutdoorFieldRouter:
 
     def __init__(self, sr: int = 48000):
         self.sr = int(sr)
+        self.now: Optional[float] = None
+        self.settle_s = 0.3
+        self._pending: Optional[tuple] = None
         # layer → list of path dicts
         self._speaker_paths: Dict[str, List[dict]] = {}
         self._listener_paths: Dict[str, List[dict]] = {}
@@ -164,10 +167,15 @@ class OutdoorFieldRouter:
             round(float(L.x), 2),
             round(float(L.z), 2),
             round(float(getattr(L, "yaw", 0.0)), 3),
+            str(getattr(room, "wall_material", "")),
+            round(float(getattr(room, "wall_thickness", 0.0) or 0.0), 3),
         )
 
     def _build_paths(self, room):
+        from app.audio import house_model as hm
+
         sr = self.sr
+        glaze_k = hm.glazing_k(room)
         self._speaker_paths = {k: [] for k in _LAYER_DEPTH_M}
         self._listener_paths = {k: [] for k in _LAYER_DEPTH_M}
         self._wall_paths = {k: [] for k in _LAYER_DEPTH_M}
@@ -207,6 +215,7 @@ class OutdoorFieldRouter:
                     height=float(getattr(w, "height", 1.2)),
                     angle_deg=angle,
                     hinge_side=str(getattr(w, "hinge_side", "left") or "left"),
+                    leak_k=glaze_k,
                 )
                 d_out = max(0.2, _len(_sub(src, ext)))
                 to_src = _sub(src, ap)
@@ -280,10 +289,23 @@ class OutdoorFieldRouter:
                     })
 
     def ensure(self, room):
+        """Rebuild the paths for a changed room — once it has held still for
+        ``settle_s`` of ``now`` (set by the engine each block), so dragging a
+        window or speaker doesn't rebuild every block."""
         fp = self._room_fingerprint(room)
-        if fp != self._fingerprint:
-            self._fingerprint = fp
-            self._build_paths(room)
+        if fp == self._fingerprint:
+            self._pending = None
+            return
+        now = getattr(self, "now", None)
+        if self._fingerprint is not None and now is not None:
+            if self._pending is None or self._pending[0] != fp:
+                self._pending = (fp, now)
+                return
+            if now - self._pending[1] < self.settle_s:
+                return
+        self._pending = None
+        self._fingerprint = fp
+        self._build_paths(room)
 
     def process(
         self,

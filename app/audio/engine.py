@@ -582,7 +582,7 @@ def _mk_wet_spit(
         pitch_k *= 1.22
         wet = min(wet, 0.62)
         soft = min(soft, 0.30)
-        ring = min(ring, 0.08)
+        ring = min(ring, 0.30)  # Ring slider may plink a pane; default 0.06 stays subtle
         attack = 2.1 + 1.4 * wet - 0.45 * sh + 2.2 * soft
         decay = 16.0 + 12.0 * wet * (size / 2.5) - 3.0 * sh + 6.0 * soft
         decay = max(14.0, min(34.0, decay))
@@ -666,7 +666,11 @@ def _mk_wet_spit(
     else:
         out = 0.68 * weight + 0.30 * smear_sig + sheen_g * sheen
 
-    # Optional “note ring” — soft off-tone body so hits can plink more if wanted
+    # Optional “note ring” — soft off-tone body so hits can plink more if wanted.
+    # Above the voiced value (0.06 pane / 0.3 wet) the Ring slider makes the
+    # body live longer and more tonal; ring_up is exactly 0 at the default.
+    ring_lo = 0.06 if is_glass else 0.3
+    ring_up = max(0.0, ring - ring_lo) / (0.24 if is_glass else 0.7)
     if ring > 0.04:
         freqs = _offtone_freqs(surface, size_mm, seed)
         ring_sig = np.zeros(n, dtype=np.float64)
@@ -678,16 +682,17 @@ def _mk_wet_spit(
                 n,
                 sr,
                 f,
-                q=3.2 + 2.5 * ring,
+                q=3.2 + 2.5 * ring + 22.0 * ring_up,
                 seed=seed * 19 + 7 + i * 31,
                 harm=0.08 * ring,
-                tone_mix=0.06 + 0.28 * ring,
+                tone_mix=0.06 + 0.28 * ring + 0.30 * ring_up,
             )
             g = (1.0 if i == 0 else 0.5) * (0.7 + 0.3 * _det_u01(seed, 40 + i))
             ring_sig += g * part
         r_env = _soft_env(n, sr, attack_ms=attack + 1.0, decay_ms=decay * 0.9, hold_ms=1.0)
         ring_sig = _rms_scale(ring_sig * r_env, 0.09)
-        out = (1.0 - 0.42 * ring) * out + (0.42 * ring) * ring_sig
+        ring_g = 0.42 * ring + 0.22 * ring_up
+        out = (1.0 - ring_g) * out + ring_g * ring_sig
 
     if is_glass:
         out = _hp1(out, (90.0 + 40.0 * sh) * pitch_k, sr)
@@ -726,15 +731,17 @@ def _mk_tin_hit(
     tail. Plastic clack = dry 6 ms HF needle. Jewelry = narrow 2–4 kHz BP.
 
     Shape: short wet impact + delayed mid smear (the spread). No sine,
-    no narrow BP.
+    no narrow BP. tone_ring (capped 0.08) only adds a broad low-mid sheet
+    bloom under the water; 0 (the default) leaves the hit untouched.
     """
-    _ = (surface, tone_ring)
     sh = max(0.0, min(1.0, float(sharpness)))
     wet = max(0.35, min(1.0, float(wetness)))
     size = max(0.35, float(size_mm))
     pk = max(0.0, min(1.0, float(tone_pitch)))
     pitch_k = 0.88 + 0.24 * pk
     soft = max(0.0, min(1.0, float(tone_soft)))
+    # Softness above the voiced 0.28 also dulls the sheet tick (exactly 1.0 at 0.28)
+    soft_dark = 1.0 - 0.40 * (soft - 0.28)
 
     attack = max(0.55, 0.85 + 1.10 * soft - 0.28 * sh)
     hit_decay = 9.0 + 4.0 * wet + 5.0 * soft - 1.5 * sh
@@ -767,7 +774,7 @@ def _mk_tin_hit(
 
     tick = 0.48 * white + 0.52 * pink
     tick = _hp1(tick, (720.0 + 380.0 * sh) * pitch_k, sr)
-    tick = _lp1(tick, (4200.0 + 1800.0 * sh) * pitch_k, sr)
+    tick = _lp1(tick, (4200.0 + 1800.0 * sh) * pitch_k * soft_dark, sr)
     t_env = _soft_env(
         n, sr,
         attack_ms=attack,
@@ -793,10 +800,32 @@ def _mk_tin_hit(
     else:
         smear_sig = _rms_scale(smear * d_env, 0.072)
 
-    tick_g = 0.34 + 0.28 * sh
+    tick_g = (0.34 + 0.28 * sh) * soft_dark
     body_g = 0.42 - 0.10 * sh
     disp_g = 0.38 + 0.10 * wet - 0.06 * sh
     out = body_g * body + tick_g * tick + disp_g * smear_sig
+
+    # Ring slider: the sheet blooming a little under the water. Low-Q, kept
+    # below ~1.8 kHz and mostly noise — the 2–4 kHz ping is what read as jewelry.
+    ring = max(0.0, min(0.08, float(tone_ring)))
+    if ring > 0.004:
+        r = ring / 0.08
+        freqs = [f * pitch_k for f in _offtone_freqs(surface, size_mm, seed)]
+        freqs = [f for f in freqs if 250.0 <= f <= 1800.0] or [min(1800.0, max(250.0, freqs[0]))]
+        bloom = np.zeros(n, dtype=np.float64)
+        for i, f in enumerate(freqs):
+            bloom += (1.0 if i == 0 else 0.5) * _resonator_noise(
+                n, sr, f, q=6.0 + 12.0 * r, seed=seed * 23 + 5 + i * 37,
+                harm=0.0, tone_mix=0.12 + 0.25 * r,
+            )
+        bl_env = _soft_env(
+            n, sr,
+            attack_ms=attack + 0.8,
+            decay_ms=hit_decay + 0.5 * disp_decay,
+            hold_ms=0.8,
+        )
+        bloom = _rms_scale(bloom * bl_env, 0.09)
+        out = (1.0 - 0.32 * r) * out + (0.32 * r) * bloom
 
     out = _hp1(out, 45.0, sr)
     out = _lp1(out, 5000.0 + 1600.0 * sh, sr)
@@ -1041,7 +1070,7 @@ def synth_drop(
     elif glass:
         tw = 0.52 if tone_wet is None else max(0.25, min(1.0, float(tone_wet)))
         ts = 0.22 if tone_soft is None else max(0.0, min(1.0, float(tone_soft)))
-        tr = 0.06 if tone_ring is None else min(tr, 0.12)
+        tr = 0.06 if tone_ring is None else min(tr, 0.30)
     else:
         tw = (0.85 + 0.12 * (1.0 - sh)) if tone_wet is None else max(0.2, min(1.0, float(tone_wet)))
         ts = 0.55 if tone_soft is None else max(0.0, min(1.0, float(tone_soft)))
